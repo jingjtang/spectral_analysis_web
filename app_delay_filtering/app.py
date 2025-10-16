@@ -9,6 +9,7 @@ from dash import Dash, dcc, html, Input, Output, State
 import plotly.graph_objects as go
 import warnings
 from plotly.subplots import make_subplots
+from functools import lru_cache
 
 # more real data for delay disribution
 # https://opendatasus.saude.gov.br/dataset/srag-2021-a-2024?utm_source=chatgpt.com
@@ -16,57 +17,64 @@ from plotly.subplots import make_subplots
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 
-# =============== Load Confirmed Case Data (AR states file) ===============
-df_full = pd.read_csv("./data/combined_state_no_revision.csv")
-df_full["time_value"] = pd.to_datetime(df_full["time_value"])
-df_full = df_full.dropna(subset=["JHU-Cases"])
-df_full = df_full.sort_values("time_value")
-geo_options = sorted(df_full["geo_value"].unique())
+from functools import lru_cache
 
-# =============== Helper: Real delay sources =====================
+@lru_cache(maxsize=1)
+def load_cases_df():
+    df = pd.read_csv("./data/combined_state_no_revision.csv")
+    # downcast + normalize
+    df["time_value"] = pd.to_datetime(df["time_value"])
+    df = df.dropna(subset=["JHU-Cases"])
+    df["geo_value"] = df["geo_value"].astype("category")
+    # float32 saves memory
+    df["JHU-Cases"] = pd.to_numeric(df["JHU-Cases"], errors="coerce", downcast="float")
+    df = df.sort_values("time_value")
+    return df
+
+@lru_cache(maxsize=1)
+def get_geo_options():
+    df = load_cases_df()
+    return tuple(sorted(df["geo_value"].cat.categories.tolist()))
+
+@lru_cache(maxsize=1)
+def prebuild_series_by_geo():
+    """
+    Build a dict: geo -> (time_numpy, cases_numpy)
+    All arrays are float32 to reduce RAM.
+    """
+    df = load_cases_df()
+    # ensure daily unique index per geo; your groupby-mean can be done once here
+    g = df.groupby(["geo_value", "time_value"])["JHU-Cases"].mean().rename("cases").reset_index()
+    out = {}
+    for geo, sub in g.groupby("geo_value"):
+        sub = sub.sort_values("time_value")
+        out[geo] = (
+            sub["time_value"].to_numpy(),                    # datetime64[ns]
+            sub["cases"].to_numpy(dtype=np.float32)          # float32
+        )
+    return out
+
 REAL_SOURCES = {
     "cn30": "./data/cn30_linelist_reporting_delay_from_symptom_onset.csv",
     "uscdc": "./data/uscdc_linelist_reporting_delay_from_symptom_onset.csv",
     "hk": "./data/hk_linelist_reporting_delay_from_symptom_onset.csv",
 }
 
+@lru_cache(maxsize=8)
 def load_real_delay_source(kind: str) -> pd.DataFrame:
-    """
-    Load a real linelist-aggregated delay file with columns:
-      reference_date, report_date, count, delay
-
-    Rules:
-      - Always drop negative delays (Gamma support is [0, inf)).
-      - For 'uscdc' ONLY, also drop delay == 0 (i.e., keep delay > 0).
-      - For other sources, keep delay == 0.
-    """
     path = REAL_SOURCES.get(kind)
     if path is None:
         raise ValueError(f"Unknown real-source: {kind}")
     df = pd.read_csv(path)
-
-    # Basic normalization
     df["reference_date"] = pd.to_datetime(df["reference_date"])
-    df["report_date"] = pd.to_datetime(df["report_date"], errors="coerce")
-    df["count"] = df["count"].astype(float)
-    df["delay"] = df["delay"].astype(int)
-
-    # Always remove negative delays
+    df["report_date"] = pd.to_datetime(df.get("report_date"), errors="coerce")
+    # downcast
+    df["count"] = pd.to_numeric(df["count"], errors="coerce", downcast="float")
+    df["delay"] = pd.to_numeric(df["delay"], errors="coerce", downcast="integer").astype(int)
     df = df[df["delay"] >= 0].copy()
-
-    # Additional rule for US CDC only: remove delay == 0
     if kind == "uscdc":
         df = df[df["delay"] > 0].copy()
-
     return df
-
-# Cache (simple in-memory) so we don't re-read on every callback
-_real_cache = {}
-
-def get_real_df(kind: str) -> pd.DataFrame:
-    if kind not in _real_cache:
-        _real_cache[kind] = load_real_delay_source(kind)
-    return _real_cache[kind]
 
 # =============== Rolling kernel builder (Histogram or KDE) ===============
 def build_delay_kernel_for_window(
@@ -236,6 +244,7 @@ def create_app(server, prefix="/app_delay_filtering/"):
         suppress_callback_exceptions=True,
         title="COVID Delay-Aware Deconvolution (Rolling Kernel)"
     )
+    geo_options = get_geo_options()
 
     dash_app.layout = html.Div([
         html.Div([
@@ -344,7 +353,7 @@ def create_app(server, prefix="/app_delay_filtering/"):
         if delay_source == "synthetic":
             return ""
         try:
-            df_real = get_real_df(delay_source)
+            df_real = load_real_delay_source(delay_source)
             total_count = df_real["count"].sum()
             min_date = df_real["reference_date"].min().date()
             max_date = df_real["reference_date"].max().date()
@@ -372,10 +381,13 @@ def create_app(server, prefix="/app_delay_filtering/"):
     def update_figures(n_clicks, geo_value, delay_source, mean, scale,
                        kernel_method, window_days, max_delay, window_end_str,
                        hf_strength, hf_freq, I_thresh=0.1):
-        df = df_full[df_full["geo_value"] == geo_value]
-        df = df.groupby("time_value")["JHU-Cases"].mean().reset_index().sort_values("time_value")
-        confirmed = df["JHU-Cases"].values.astype(float)
-        time = df["time_value"].values
+        series_map = prebuild_series_by_geo()
+
+        if geo_value not in series_map:
+            return go.Figure(), go.Figure(), go.Figure()  # no data fallback
+
+        time, confirmed = series_map[geo_value]
+        confirmed = confirmed.astype(np.float64, copy=False)  # ensure numeric
 
         if delay_source == "synthetic":
             L = min(len(confirmed), (max_delay if max_delay else 60) + 1)
@@ -385,7 +397,7 @@ def create_app(server, prefix="/app_delay_filtering/"):
             var = np.sum((np.arange(L) ** 2) * delay_kernel) - mu**2
             gamma_fit_txt = f" (μ≈{mu:.2f}, σ²≈{var:.2f})"
         else:
-            real_df = get_real_df(delay_source)
+            real_df = load_real_delay_source(delay_source)
             window_end = real_df["reference_date"].max() if window_end_str is None else pd.to_datetime(window_end_str)
             Y = int(window_days) if window_days else 30
             Dmax = int(max_delay) if max_delay else 60

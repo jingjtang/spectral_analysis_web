@@ -5,10 +5,14 @@ from flask import Flask, render_template_string
 from app_delay_filtering.app import create_app as create_delay_app
 from app_fft_explorer.app import create_app as create_fft_app
 # from app_multiple_delay_filtering.app import create_app as create_multi_app
+from flask import Flask
+from flask_caching import Cache
+
+cache = Cache(config={"CACHE_TYPE": "SimpleCache", "CACHE_DEFAULT_TIMEOUT": 3600})
 
 def create_server():
     server = Flask(__name__)
-
+    cache.init_app(server)
     #  main page
     @server.route("/")
     def index():
