@@ -228,10 +228,6 @@ def tikhonov_deconvolution(observed, delay, lam=0.1):
 
 # =============== Dash App UI =============================================
 def create_app(server, prefix="/app_delay_filtering/"):
-    """
-    在给定 Flask server 上创建并挂载本 Dash 子应用。
-    返回 dash_app 实例。
-    """
     dash_app = Dash(
         __name__,
         server=server,
