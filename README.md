@@ -17,8 +17,8 @@ Simulate symptomatic-to-reporting processes using configurable delay distributio
 ## Setup
 
 ```bash
-git clone https://github.com/cmu-delphi/spectral-analysis.git
-cd spectral-analysis
+git clone hhttps://github.com/jingjtang/spectral_analysis_web.git
+cd spectral_analysis_web
 
 # Create and activate a Python 3.8 environment
 python3.8 -m venv venv
@@ -28,20 +28,13 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-## Run an App
-
-To run App app-name
+## Run the dashboard (local)
 
 ```bash
-python app-name/app.py
-```
-
-Each app is fully self-contained.
-
-For example, from within the spectral-analysis folder, you can launch App A with:
-```
-python app_fft_transformation/app.py
+python main.py
 ```
 
 Then open the link in your browser (usually http://127.0.0.1:8050/).
 
+## Hosted version
+The app is also available on Render: https://spectral-analysis-web.onrender.com
