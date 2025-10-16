@@ -7,10 +7,18 @@ from scipy.fft import fft, ifft, fftfreq
 from dash import Dash, dcc, html, Input, Output, State
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+from functools import lru_cache
+import uuid
+from flask import request
+from flask_caching import Cache
+
+# simple server-side cache (in-memory)
+cache = Cache(config={"CACHE_TYPE": "SimpleCache", "CACHE_DEFAULT_TIMEOUT": 3600})
 
 DEFAULT_PATH = "./data/ar_state.csv"
 
 # ============== Data Loading ==============
+@lru_cache(maxsize=8)
 def load_default_df():
     df = pd.read_csv(DEFAULT_PATH)
     df["time_value"] = pd.to_datetime(df["time_value"]).dt.strftime("%Y-%m-%d")
@@ -179,6 +187,8 @@ def generate_fft_figure(df, state, signal, pad_length=10,
 
 # ================= Factory App =================
 def create_app(server, prefix="/app_fft_upload/"):
+    cache.init_app(server)  # <-- init cache
+
     dash_app = Dash(
         __name__,
         server=server,
@@ -192,6 +202,9 @@ def create_app(server, prefix="/app_fft_upload/"):
 
         html.Div(style={"width": "28%", "padding": "20px"}, children=[
             html.H3("Controls"),
+            dcc.Store(id="session-id"),
+            dcc.Store(id="data-key"),
+            dcc.Store(id="schema-store"),  # keep only small schema in browser
             dcc.Upload(
                 id='upload-data',
                 children=html.Div(['Drag and Drop or ', html.A('Select CSV File')]),
@@ -230,35 +243,64 @@ def create_app(server, prefix="/app_fft_upload/"):
 
     # -------- Callbacks --------
     @dash_app.callback(
-        Output("data-store", "data"),
+        Output("session-id", "data"),
+        Input("session-id", "data"),
+        prevent_initial_call=False
+    )
+    def ensure_session_id(existing):
+        if existing:
+            return existing
+        # tie to client if you want: request.remote_addr etc.
+        return str(uuid.uuid4())
+
+    @dash_app.callback(
+        Output("data-key", "data"),
         Output("schema-store", "data"),
         Output("upload-status", "children"),
         Input("upload-data", "contents"),
         State("upload-data", "filename"),
+        State("session-id", "data"),
         prevent_initial_call=False
     )
-    def init_or_upload(contents, filename):
-        if contents is not None and filename:
-            try:
+    def init_or_upload(contents, filename, sid):
+        def downcast(df):
+            # shrink memory: dates → str, categorical for geo_value, float32 for values
+            if "geo_value" in df.columns:
+                df["geo_value"] = df["geo_value"].astype("category")
+            for c in df.columns:
+                if pd.api.types.is_float_dtype(df[c]):
+                    df[c] = pd.to_numeric(df[c], errors="coerce", downcast="float")
+                elif pd.api.types.is_integer_dtype(df[c]):
+                    df[c] = pd.to_numeric(df[c], errors="coerce", downcast="integer")
+            return df
+
+        try:
+            if contents and filename:
                 df_up = parse_uploaded_contents(contents, filename)
+                df_up = downcast(df_up)
                 schema = detect_schema(df_up)
-                status = f"Loaded file: {filename}\n"
-                return (schema["df"].to_dict("records"),
-                        {"mode": schema["mode"], "states": schema["states"], "signals": schema["signals"]},
-                        status)
-            except Exception as e:
-                default_df = load_default_df()
-                default_schema = detect_schema(default_df)
-                status = f"Failed to parse '{filename}': {e}\nLoaded default data instead."
-                return (default_schema["df"].to_dict("records"),
-                        {"mode": default_schema["mode"], "states": default_schema["states"], "signals": default_schema["signals"]},
-                        status)
-        default_df = load_default_df()
-        default_schema = detect_schema(default_df)
-        status = f"Using default dataset at {DEFAULT_PATH}\nMode: {default_schema['mode']}\nRows: {len(default_schema['df'])}"
-        return (default_schema["df"].to_dict("records"),
-                {"mode": default_schema["mode"], "states": default_schema["states"], "signals": default_schema["signals"]},
-                status)
+                key = f"{sid}:uploaded"
+                cache.set(key, schema["df"], timeout=3600)  # store df only on server
+                # send only schema (small) to client
+                return key, {"mode": schema["mode"], "states": schema["states"],
+                             "signals": schema["signals"]}, f"Loaded file: {filename}\n"
+            else:
+                df = load_default_df()
+                df = downcast(df)
+                schema = detect_schema(df)
+                key = f"{sid}:default"
+                cache.set(key, schema["df"], timeout=3600)
+                return key, {"mode": schema["mode"], "states": schema["states"], "signals": schema["signals"]}, \
+                    f"Using default dataset at {DEFAULT_PATH}\nMode: {schema['mode']}\nRows: {len(schema['df'])}"
+        except Exception as e:
+            # robust fallback to default
+            df = load_default_df()
+            df = downcast(df)
+            schema = detect_schema(df)
+            key = f"{sid}:default"
+            cache.set(key, schema["df"], timeout=3600)
+            return key, {"mode": schema["mode"], "states": schema["states"], "signals": schema["signals"]}, \
+                f"Failed to parse '{filename}': {e}\nLoaded default data instead."
 
     @dash_app.callback(
         Output("state-dropdown", "options"),
@@ -279,7 +321,7 @@ def create_app(server, prefix="/app_fft_upload/"):
 
     @dash_app.callback(
         Output("fft-figure", "figure"),
-        Input("data-store", "data"),
+        Input("data-key", "data"),  # <- use key, not records
         Input("schema-store", "data"),
         Input("state-dropdown", "value"),
         Input("signal-dropdown", "value"),
@@ -287,17 +329,25 @@ def create_app(server, prefix="/app_fft_upload/"):
         Input("pad-length", "value"),
         Input("pad-side", "value"),
     )
-    def update_fft_plot(data_records, schema, state, signal, freq_range, pad_len, pad_side):
-        if not data_records or not schema or state is None or signal is None:
+    def update_fft_plot(data_key, schema, state, signal, freq_range, pad_len, pad_side):
+        if not data_key or not schema or state is None or signal is None:
             return go.Figure().update_layout(title="No data available")
-        df = pd.DataFrame(data_records).copy()
+
+        df = cache.get(data_key)
+        if df is None:
+            return go.Figure().update_layout(title="Data expired from cache. Please reload.")
+
+        # IMPORTANT: avoid df.copy(); work on df directly or on small slices
         if "time_value" not in df.columns or "geo_value" not in df.columns or signal not in df.columns:
             return go.Figure().update_layout(title="Uploaded data missing required columns after normalization.")
+
         low_cutoff, high_cutoff = freq_range
-        return generate_fft_figure(df, state, signal,
-                                   pad_length=int(pad_len) if pad_len is not None else 0,
-                                   low_cutoff=float(low_cutoff), high_cutoff=float(high_cutoff),
-                                   filter_type="hard", pad_side=pad_side)
+        return generate_fft_figure(
+            df, state, signal,
+            pad_length=int(pad_len) if pad_len is not None else 0,
+            low_cutoff=float(low_cutoff), high_cutoff=float(high_cutoff),
+            filter_type="hard", pad_side=pad_side
+        )
 
     return dash_app
 
