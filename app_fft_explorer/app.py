@@ -1,45 +1,80 @@
-# app_upload_fft.py  (revised with fixed graph height)
+# app_fft_explorer/app.py  — memory friendly factory version
 import base64
 import io
+import hashlib
+from typing import Optional
+
 import numpy as np
 import pandas as pd
-from scipy.fft import fft, ifft, fftfreq
+from scipy.fft import rfft, irfft, rfftfreq
 from dash import Dash, dcc, html, Input, Output, State
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
-
 DEFAULT_PATH = "./data/ar_state.csv"
 
+# ------------ simple in-process cache ------------
+_SERVER_CACHE = {}  # key -> pd.DataFrame
+
+def _optimize_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Downcast dtypes to cut memory; make geo categorical; keep time as datetime64."""
+    df = df.copy()
+    if "time_value" in df.columns:
+        df["time_value"] = pd.to_datetime(df["time_value"], errors="coerce")
+    if "geo_value" in df.columns and df["geo_value"].dtype != "category":
+        df["geo_value"] = df["geo_value"].astype("category")
+    for c in df.columns:
+        if c in ("time_value", "geo_value"):
+            continue
+        if pd.api.types.is_integer_dtype(df[c]):
+            df[c] = pd.to_numeric(df[c], errors="coerce", downcast="integer")
+        elif pd.api.types.is_float_dtype(df[c]):
+            df[c] = pd.to_numeric(df[c], errors="coerce", downcast="float")
+    return df
+
+def _cache_key(tag: str, df: pd.DataFrame) -> str:
+    h = hashlib.md5()
+    h.update(str(df.shape).encode())
+    h.update(",".join(map(str, df.columns)).encode())
+    return f"fft:{tag}:{h.hexdigest()}"
+
+def cache_put_df(df: pd.DataFrame, tag: str="uploaded") -> str:
+    key = _cache_key(tag, df)
+    _SERVER_CACHE[key] = df
+    return key
+
+def cache_get_df(key: str) -> Optional[pd.DataFrame]:
+    return _SERVER_CACHE.get(key)
+
 # ============== Data Loading ==============
-def load_default_df():
+def load_default_df() -> pd.DataFrame:
     df = pd.read_csv(DEFAULT_PATH)
-    df["time_value"] = pd.to_datetime(df["time_value"]).dt.strftime("%Y-%m-%d")
+    df = _optimize_df(df)
     return df
 
 def parse_uploaded_contents(contents: str, filename: str) -> pd.DataFrame:
-    content_type, content_string = contents.split(',')
+    _, content_string = contents.split(',')
     decoded = base64.b64decode(content_string)
     try:
         df = pd.read_csv(io.StringIO(decoded.decode('utf-8')))
     except UnicodeDecodeError:
         df = pd.read_csv(io.StringIO(decoded.decode('latin-1')))
-    for cand in ["time_value", "time", "date"]:
-        if cand in df.columns:
-            df[cand] = pd.to_datetime(df[cand], errors="coerce").dt.strftime("%Y-%m-%d")
+    df = _optimize_df(df)
     return df
 
 def detect_schema(df: pd.DataFrame):
+    # prefer wide format with geo/time + numeric columns
     if ("geo_value" in df.columns) and ("time_value" in df.columns):
         non_meta = [c for c in df.columns if c not in ["geo_value", "time_value"]]
         numeric_signals = [c for c in non_meta if pd.api.types.is_numeric_dtype(df[c])]
         if len(numeric_signals) >= 1:
             out = df.copy()
-            out["time_value"] = pd.to_datetime(out["time_value"], errors="coerce").dt.strftime("%Y-%m-%d")
-            states = sorted(out["geo_value"].dropna().unique())
+            out["time_value"] = pd.to_datetime(out["time_value"], errors="coerce")
+            states = sorted(out["geo_value"].dropna().unique().tolist())
             signals = sorted(numeric_signals)
             return {"mode": "wide", "states": states, "signals": signals, "df": out}
 
+    # fallback: simple 2-col value
     time_col = None
     for cand in ["time", "date", "time_value"]:
         if cand in df.columns:
@@ -50,64 +85,82 @@ def detect_schema(df: pd.DataFrame):
     simple_df = pd.DataFrame()
     if time_col and len(numeric_cols) >= 1:
         signal_col = numeric_cols[0]
-        simple_df["time_value"] = pd.to_datetime(df[time_col], errors="coerce").dt.strftime("%Y-%m-%d")
+        simple_df["time_value"] = pd.to_datetime(df[time_col], errors="coerce")
         simple_df["geo_value"] = "uploaded"
         simple_df["value"] = pd.to_numeric(df[signal_col], errors="coerce")
     elif not time_col and len(numeric_cols) >= 1:
         signal_col = numeric_cols[0]
         n = len(df)
         base = pd.Timestamp("2000-01-01")
-        simple_df["time_value"] = [(base + pd.Timedelta(days=i)).strftime("%Y-%m-%d") for i in range(n)]
+        simple_df["time_value"] = base + pd.to_timedelta(np.arange(n), unit='D')
         simple_df["geo_value"] = "uploaded"
         simple_df["value"] = pd.to_numeric(df[signal_col], errors="coerce")
     else:
         raise ValueError("Could not detect a usable schema.")
+    simple_df = _optimize_df(simple_df)
     return {"mode": "simple", "states": ["uploaded"], "signals": ["value"], "df": simple_df}
 
-# ============== FFT Utils ==============
+# ============== FFT Utils (rFFT) ==============
 def extract_signal(df, state, signal, date_cutoff="2020-12-31"):
-    curve = df.loc[
-        (df["geo_value"] == state) & (df["time_value"] <= date_cutoff),
-        ["time_value", signal]
-    ].sort_values("time_value").dropna()
+    mask = (df["geo_value"] == state)
+    if date_cutoff:
+        cutoff = pd.to_datetime(date_cutoff)
+        mask &= (df["time_value"] <= cutoff)
+    cols = ["time_value", signal]
+    curve = df.loc[mask, cols].dropna().sort_values("time_value")
     if curve.empty:
         return None, None, None
     t_raw = pd.to_datetime(curve["time_value"])
-    y_raw = curve[signal].astype(float).values
-    y_raw[np.isnan(y_raw)] = 0.0
+    y_raw = curve[signal].astype("float32").to_numpy(copy=False)
+    y_raw = np.nan_to_num(y_raw, nan=0.0).astype("float32", copy=False)
     y_mean = float(np.mean(y_raw)) if len(y_raw) else 0.0
     return y_raw, t_raw, y_mean
 
+def _truncate_and_decimate(t: pd.Series, y: np.ndarray, max_points=5000):
+    """Keep last max_points and decimate further by stride to ~2000 points for plotting."""
+    if len(y) > max_points:
+        t = t.iloc[-max_points:]
+        y = y[-max_points:]
+    # pixel-aware simple decimation
+    target = 2000
+    if len(y) > target:
+        stride = int(np.ceil(len(y) / target))
+        t = t.iloc[::stride]
+        y = y[::stride]
+    return t, y
+
 def preprocess_signal(y, t_raw, pad_length, pad_side="both"):
     if pad_side == "left":
-        y_padded = np.concatenate([np.zeros(pad_length), y])
+        y_padded = np.concatenate([np.zeros(pad_length, dtype="float32"), y])
     else:
-        y_padded = np.concatenate([np.zeros(pad_length), y, np.zeros(pad_length)])
+        y_padded = np.concatenate([np.zeros(pad_length, dtype="float32"), y, np.zeros(pad_length, dtype="float32")])
     full_time = pd.date_range(
         start=t_raw.iloc[0] - pd.to_timedelta(pad_length, unit='D'),
         periods=len(y_padded), freq='D'
     )
-    return y_padded, full_time
+    return y_padded.astype("float32", copy=False), full_time
 
 def pad_for_plot(y, pad_length, pad_side="both"):
-    left = [0.0] * pad_length
-    right = [0.0] * (pad_length if pad_side == "both" else 0)
-    return np.array(left + list(y) + right, dtype=float)
+    left = np.zeros(pad_length, dtype="float32")
+    right = np.zeros(pad_length if pad_side == "both" else 0, dtype="float32")
+    return np.concatenate([left, y.astype("float32", copy=False), right])
 
 def compute_fft(y_padded, dt=1.0):
     N = len(y_padded)
-    freqs = fftfreq(N, d=dt)
-    fft_vals = fft(y_padded)
+    freqs = rfftfreq(N, d=dt)
+    fft_vals = rfft(y_padded)
     return freqs, fft_vals
 
 def apply_frequency_filter(freqs, fft_vals, low_cutoff, high_cutoff, method="hard"):
+    # freqs >= 0
     fft_filtered = fft_vals.copy()
     if method == "gaussian":
         eps = 1e-12 if high_cutoff == 0 else 0.0
         weights = np.exp(-((freqs) / (high_cutoff + eps)) ** 2)
         fft_filtered *= weights
     else:
-        fft_filtered[(np.abs(freqs) < low_cutoff) | (np.abs(freqs) > high_cutoff)] = 0
+        band = (freqs >= low_cutoff) & (freqs <= high_cutoff)
+        fft_filtered[~band] = 0
     return fft_filtered
 
 def compute_power_spectrum(freqs, fft_vals):
@@ -117,45 +170,26 @@ def compute_power_spectrum(freqs, fft_vals):
     return pos_freqs, power
 
 def compute_energy_distribution(freqs_full, fft_vals_full):
-    """
-    Returns: freqs_pos_sorted, pmf (energy PDF over positive freqs), cdf (cumulative energy share), df
-    - Positive frequencies only (exclude f <= 0)
-    - pmf[k] = P[k]/sum(P_pos), where P[k] = |Y[k]|^2
-    - cdf = cumulative sum of pmf in ascending frequency
-    """
     spectrum_full = np.abs(fft_vals_full) ** 2
     pos_mask = freqs_full > 0
     freqs_pos = freqs_full[pos_mask]
     P_pos = spectrum_full[pos_mask]
-
     if len(freqs_pos) == 0:
         return np.array([]), np.array([]), np.array([]), 1.0
-
-    # sort by freq just in case
     order = np.argsort(freqs_pos)
     f_sorted = freqs_pos[order]
     P_sorted = P_pos[order]
-
     total = float(np.sum(P_sorted))
     if total <= 0:
         pmf = np.zeros_like(P_sorted)
         cdf = np.zeros_like(P_sorted)
     else:
-        pmf = P_sorted / total               # "PDF" over discrete positive freq bins
-        cdf = np.cumsum(pmf)                 # CDF from lowest positive freq upward
-
-    # nominal bin width (uniform for FFT)
+        pmf = P_sorted / total
+        cdf = np.cumsum(pmf)
     df = float(np.mean(np.diff(f_sorted))) if len(f_sorted) > 1 else 1.0
     return f_sorted, pmf, cdf, df
 
 def entropy_from_pdf(pdf_vals, mask=None):
-    """
-    Compute spectral entropy H = -sum p log p over positive-frequency PDF.
-    Returns (H_total, H_band, H_norm, band_share).
-
-    pdf_vals: array of p(f_k) over positive freqs (sum=1).
-    mask: boolean array same length as pdf_vals selecting the user band.
-    """
     if pdf_vals is None or len(pdf_vals) == 0:
         return 0.0, 0.0, 0.0, 0.0
     p = np.asarray(pdf_vals, dtype=float)
@@ -172,108 +206,84 @@ def entropy_from_pdf(pdf_vals, mask=None):
     return H_total, H_band, H_norm, band_share
 
 def bin_energy_pdf(pdf_freqs, pdf_vals, nbins=50, use_log=False):
-    """
-    Coarsen the discrete PDF p(f) into nbins across frequency.
-    Returns bin_centers, pdf_binned (sum of p(f) in each bin), bin_edges.
-    If use_log is True, bins are uniform in log-frequency (exclude non-positive freqs beforehand).
-    """
     if pdf_freqs is None or len(pdf_freqs) == 0:
         return np.array([]), np.array([]), np.array([])
-
     f = np.asarray(pdf_freqs)
     p = np.asarray(pdf_vals)
     mask = f > 0
-    f = f[mask]
-    p = p[mask]
+    f = f[mask]; p = p[mask]
     if len(f) == 0:
         return np.array([]), np.array([]), np.array([])
-
     if use_log:
         fmin, fmax = np.min(f), np.max(f)
         edges = np.logspace(np.log10(fmin), np.log10(fmax), nbins + 1)
     else:
         edges = np.linspace(np.min(f), np.max(f), nbins + 1)
-
     pdf_binned = np.zeros(nbins, dtype=float)
-    # assign each freq to a bin
     idx = np.searchsorted(edges, f, side="right") - 1
     idx = np.clip(idx, 0, nbins - 1)
     for k in range(nbins):
         pdf_binned[k] = p[idx == k].sum()
-
-    # bar x-locations = bin centers in linear freq
     bin_centers = 0.5 * (edges[:-1] + edges[1:])
     return bin_centers, pdf_binned, edges
 
 def create_fft_plot(
     full_time, y_plot_original, y_plot_recon,
-    freqs_power, power,                   # AFTER filtering, for Fig 2
-    signal, state, yaxis_type="linear",
+    freqs_power, power, signal, state, yaxis_type="linear",
     frac_info=None,
-
-    # Fig 3 inputs (from PRE-filter spectrum)
     pdf_freqs=None, pdf_vals=None, cdf_vals=None, df_bin=1.0,
     band_mask_pdf=None,
     pdf_binned_freqs=None, pdf_binned_vals=None, pdf_yaxis_type="linear",
-
-    # NEW: entropy info to show in Fig 3 subtitle
     H_total=None, H_band=None, H_norm=None, band_share=None
 ):
     subtitle_power = "FFT Amplitude Spectrum (Frequency Domain)"
     if frac_info is not None:
         subtitle_power += f"<br> — Selected Band Energy = {frac_info:.1%}"
 
-    # Build entropy subtitle text (plain text so it renders)
     ent_bits = []
-    if H_total is not None:
-        ent_bits.append(f"H={H_total:.3f}")
-    if H_norm is not None:
-        ent_bits.append(f"H_norm={H_norm:.3f}")
-    if band_share is not None:
-        ent_bits.append(f"Entropy Fraction={band_share:.1%}")
-    ent_txt = (" - " + " ".join(ent_bits)) if ent_bits else ""
-
-    subtitle_pdf = (
-        "Energy PDF (bars, binned) & CDF (line)<br>"
-        + ent_txt
-    )
+    if H_total is not None: ent_bits.append(f"H={H_total:.3f}")
+    if H_norm  is not None: ent_bits.append(f"H_norm={H_norm:.3f}")
+    if band_share is not None: ent_bits.append(f"Entropy Fraction={band_share:.1%}")
+    subtitle_pdf = "Energy PDF (bars, binned) & CDF (line)<br>" + (" - " + " ".join(ent_bits) if ent_bits else "")
 
     fig = make_subplots(
         rows=2, cols=2,
-        specs=[[{"colspan": 2}, None],
-               [{}, {"secondary_y": True}]],
-        vertical_spacing=0.15,
-        horizontal_spacing=0.1,
-        subplot_titles=[
-            "Time-Domain Signal (Original vs Reconstructed)",
-            "Power Spectrum (After Filtering)",
-            "Energy PDF & CDF (Positive Frequencies)"
-        ]
+        specs=[[{"colspan": 2}, None],[{}, {"secondary_y": True}]],
+        vertical_spacing=0.15, horizontal_spacing=0.1,
+        # subplot_titles=[
+        #     "Time-Domain Signal (Original vs Reconstructed)",
+        #     "Power Spectrum (After Filtering)",
+        #     "Energy PDF & CDF (Positive Frequencies)"
+        # ]
     )
-
-    # --- Row 1: Time series ---
+    # --- Row 1: Time series (figure 1) ---
     fig.add_trace(go.Scatter(x=full_time, y=y_plot_original,
-                             name="Original (mean-removed)", line=dict(color="gray")),
+                             name="Original (mean-removed)",
+                             line=dict(color="gray"),
+                             showlegend=True
+                  ),
                   row=1, col=1)
     fig.add_trace(go.Scatter(x=full_time, y=y_plot_recon,
-                             name="Reconstructed (filtered, mean-removed)", line=dict(color="blue")),
+                             name="Reconstructed (filtered, mean-removed)",
+                             line=dict(color="blue"),
+                             showlegend=True
+                  ),
                   row=1, col=1)
-
-    # --- Row 2, Col 1: Power (after filtering) ---
+    # --- Row 2, Col 1: Power (figure 2) ---
     order = np.argsort(freqs_power)
     f2 = freqs_power[order]; P2 = power[order]
-    if len(f2) > 1:
-        df_local = float(np.mean(np.diff(f2))); widths = np.full_like(f2, df_local)
-    else:
-        widths = np.array([0.0])
+    widths = (np.full_like(f2, float(np.mean(np.diff(f2)))) if len(f2) > 1 else np.array([0.0]))
     fig.add_trace(go.Bar(x=f2, y=P2, width=widths,
-                         marker=dict(color='rgba(0,128,0,0.4)'), name="Power"),
+                         marker=dict(color='rgba(0,128,0,0.4)'),
+                         name="Power",
+                         showlegend=False
+                  ),
                   row=2, col=1)
     fig.add_trace(go.Scatter(x=f2, y=P2, mode='markers',
-                             marker=dict(size=4, color='green'), showlegend=False),
+                             marker=dict(size=4, color='green'),
+                             showlegend=False),
                   row=2, col=1)
 
-    # --- Row 2, Col 2: PDF (binned) + CDF ---
     if pdf_binned_freqs is not None and len(pdf_binned_freqs) > 0 and pdf_binned_vals is not None:
         x_pdf = pdf_binned_freqs; y_pdf = pdf_binned_vals
         if len(x_pdf) > 1:
@@ -286,63 +296,41 @@ def create_fft_plot(
             widths_pdf = np.array([df_bin])
         fig.add_trace(go.Bar(x=x_pdf, y=y_pdf, width=widths_pdf,
                              name="Energy PDF p(f) (binned)",
-                             marker=dict(color='rgba(0,0,255,0.45)')),
+                             marker=dict(color='rgba(0,0,255,0.45)'),
+                             showlegend=False),
                       row=2, col=2, secondary_y=False)
-    elif pdf_freqs is not None and len(pdf_freqs) > 0 and pdf_vals is not None:
-        widths_pdf = np.full_like(pdf_freqs, df_bin) if len(pdf_freqs) > 1 else np.array([0.0])
-        fig.add_trace(go.Bar(x=pdf_freqs, y=pdf_vals, width=widths_pdf,
-                             name="Energy PDF p(f)", marker=dict(color='rgba(0,0,255,0.35)')),
-                      row=2, col=2, secondary_y=False)
-
-    # if band_mask_pdf is not None and pdf_freqs is not None and len(pdf_freqs) > 0:
-    #     fig.add_trace(go.Bar(x=pdf_freqs[band_mask_pdf], y=pdf_vals[band_mask_pdf],
-    #                          name="Selected band (PDF)",
-    #                          marker=dict(line=dict(width=1.0), opacity=0.9)),
-    #                   row=2, col=2, secondary_y=False)
-
-    if band_mask_pdf is not None and len(pdf_freqs) > 0:
-        fig.add_vline(
-            x=pdf_freqs[band_mask_pdf].min(),
-            line=dict(color="red", dash="dash"),
-            row=2, col=2
-        )
-        fig.add_vline(
-            x=pdf_freqs[band_mask_pdf].max(),
-            line=dict(color="red", dash="dash"),
-            row=2, col=2
-        )
 
     if cdf_vals is not None and pdf_freqs is not None and len(pdf_freqs) == len(cdf_vals):
         fig.add_trace(go.Scatter(x=pdf_freqs, y=cdf_vals, mode='lines+markers',
-                                 name="CDF (cumulative energy share)"),
+                                 name="CDF (cumulative energy share)",
+                                 showlegend=False),
                       row=2, col=2, secondary_y=True)
 
-    # Axes & layout
+    if band_mask_pdf is not None and pdf_freqs is not None and len(pdf_freqs) > 0 and band_mask_pdf.any():
+        fig.add_vline(x=float(pdf_freqs[band_mask_pdf].min()), line=dict(color="red", dash="dash"), row=2, col=2)
+        fig.add_vline(x=float(pdf_freqs[band_mask_pdf].max()), line=dict(color="red", dash="dash"), row=2, col=2)
+
     fig.update_xaxes(title_text="Time", row=1, col=1)
     fig.update_xaxes(title_text="Frequency (cycles/day)", row=2, col=1)
     fig.update_yaxes(title_text="Power", type=yaxis_type, row=2, col=1)
-
     fig.update_xaxes(title_text="Frequency (cycles/day)", row=2, col=2)
     fig.update_yaxes(title_text="PDF p(f)", type=pdf_yaxis_type, row=2, col=2, secondary_y=False)
     fig.update_yaxes(title_text="CDF", range=[0, 1], row=2, col=2, secondary_y=True)
 
     fig.update_layout(
-        height=900,
-        title=f"{signal} in {state.upper()} — FFT Analysis",
+        height=750,
+        title=f"{signal} in {state} — FFT Analysis",
         showlegend=True,
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
         annotations=[
-            dict(text="Time-Domain Signal (Original vs Reconstructed)",
-                 xref="paper", yref="paper", x=0.0, y=1.085, showarrow=False, font=dict(size=13)),
-            dict(text=subtitle_power,
-                 xref="paper", yref="paper", x=0.12, y=0.46, showarrow=False, font=dict(size=12)),
-            dict(text=subtitle_pdf,   # <— shows entropy here
-                 xref="paper", yref="paper", x=0.88, y=0.46, showarrow=False,
+            dict(text="Time-Domain Signal (Original vs Reconstructed)", xref="paper", yref="paper",
+                 x=0.0, y=1.08, showarrow=False, font=dict(size=13)),
+            dict(text=subtitle_power, xref="paper", yref="paper", x=0.12, y=0.46, showarrow=False, font=dict(size=12)),
+            dict(text=subtitle_pdf, xref="paper", yref="paper", x=0.88, y=0.46, showarrow=False,
                  font=dict(size=12), xanchor="right")
         ]
     )
     return fig
-
 
 def generate_fft_figure(
     df, state, signal, pad_length=0,
@@ -355,9 +343,12 @@ def generate_fft_figure(
     if y_raw is None:
         return go.Figure().update_layout(title="No data available")
 
-    y_for_fft = y_raw - y_mean
-    y_padded_fft, full_time = preprocess_signal(y_for_fft, t_raw, pad_length, pad_side)
-    y_plot_original = pad_for_plot(y_for_fft, pad_length, pad_side)
+    # 先截断/抽稀，再做 FFT（极大降低内存和计算）
+    t_raw, y_raw = _truncate_and_decimate(t_raw, y_raw, max_points=5000)
+
+    y_for_fft = (y_raw - y_mean).astype("float32", copy=False)
+    y_padded_fft, full_time = preprocess_signal(y_for_fft, t_raw, int(pad_length or 0), pad_side)
+    y_plot_original = pad_for_plot(y_for_fft, int(pad_length or 0), pad_side)
 
     freqs_full, fft_vals_full = compute_fft(y_padded_fft)
 
@@ -370,29 +361,27 @@ def generate_fft_figure(
     band_energy = float(np.sum(spectrum_pos_all[band_mask])) if total_energy > 0 else 0.0
     frac_energy = band_energy / total_energy if total_energy > 0 else 0.0
 
-    # PDF/CDF over positive freqs (pre-filter)
     pdf_freqs, pdf_vals, cdf_vals, df_bin = compute_energy_distribution(freqs_full, fft_vals_full)
     band_mask_pdf = (pdf_freqs >= low_cutoff) & (pdf_freqs <= high_cutoff) if len(pdf_freqs) else None
-
-    # --- NEW: entropy on the PDF
     H_total, H_band, H_norm, band_share = entropy_from_pdf(pdf_vals, mask=band_mask_pdf)
 
-    # BIN the PDF for visibility
     pdf_binned_freqs, pdf_binned_vals, _ = bin_energy_pdf(
-        pdf_freqs, pdf_vals, nbins=int(pdf_nbins), use_log=bool(pdf_logbins)
+        pdf_freqs, pdf_vals, nbins=int(pdf_nbins or 40), use_log=bool(pdf_logbins)
     )
 
-    # Filter for reconstruction
     filtered_fft_vals = apply_frequency_filter(freqs_full, fft_vals_full,
-                                               low_cutoff, high_cutoff,
+                                               float(low_cutoff), float(high_cutoff),
                                                method=filter_type)
-    recon_signal = np.real(ifft(filtered_fft_vals))
+    recon_signal = np.real(irfft(filtered_fft_vals, n=len(y_padded_fft))).astype("float32", copy=False)
     y_plot_recon = recon_signal
 
     freqs_pos_display, power_display = compute_power_spectrum(freqs_full, filtered_fft_vals)
 
+    # Plotly 日期要字符串
+    full_time_str = pd.to_datetime(full_time).strftime("%Y-%m-%d")
+
     return create_fft_plot(
-        full_time=full_time,
+        full_time=full_time_str,
         y_plot_original=y_plot_original,
         y_plot_recon=y_plot_recon,
         freqs_power=freqs_pos_display,
@@ -404,14 +393,13 @@ def generate_fft_figure(
         band_mask_pdf=band_mask_pdf,
         pdf_binned_freqs=pdf_binned_freqs, pdf_binned_vals=pdf_binned_vals,
         pdf_yaxis_type=pdf_yaxis_type,
-        # NEW: pass entropy to subtitle of Fig 3
         H_total=H_total, H_band=H_band, H_norm=H_norm, band_share=band_share
     )
 
 # ================= Factory App =================
-def create_app(server, prefix="/app_fft_upload/"):
+def create_app(server, prefix="/app_fft_explorer/"):
     """
-    Mounts the FFT upload explorer under the given prefix.
+    Mounts the FFT explorer under the given prefix.
     NOTE: prefix MUST end with '/'.
     """
     if not prefix.endswith("/"):
@@ -439,7 +427,7 @@ def create_app(server, prefix="/app_fft_upload/"):
                 accept='.csv', multiple=False
             ),
             html.Div(id='upload-status', style={"fontSize": "12px", "marginBottom": "10px", "whiteSpace": "pre-wrap"}),
-            dcc.Store(id="data-store"),
+            dcc.Store(id="data-key"),      # 只存 key
             dcc.Store(id="schema-store"),
             html.P("Workflow: (1) choose frequency band, (2) pad, (3) analyze.",
                    style={"fontSize": "13px", "marginBottom": "10px"}),
@@ -480,16 +468,16 @@ def create_app(server, prefix="/app_fft_upload/"):
         ]),
 
         html.Div(style={"width": "72%", "padding": "20px"}, children=[
-            html.P("The top plot always shows the mean-removed original (gray) and the mean-removed reconstruction (blue). "
-                   "Padding is shown explicitly as zeros on the original curve.",
+            html.P("The top plot shows mean-removed original (gray) and reconstruction (blue). "
+                   "Padding shows zeros on the original curve.",
                    style={"fontSize": "14px", "marginBottom": "10px"}),
-            dcc.Graph(id="fft-figure", style={"height": "750px"})
+            dcc.Graph(id="fft-figure", style={"height": "720px"})
         ])
     ])
 
     # -------- Callbacks --------
     @dash_app.callback(
-        Output("data-store", "data"),
+        Output("data-key", "data"),
         Output("schema-store", "data"),
         Output("upload-status", "children"),
         Input("upload-data", "contents"),
@@ -497,27 +485,32 @@ def create_app(server, prefix="/app_fft_upload/"):
         prevent_initial_call=False
     )
     def init_or_upload(contents, filename):
-        if contents is not None and filename:
-            try:
+        try:
+            if contents is not None and filename:
                 df_up = parse_uploaded_contents(contents, filename)
                 schema = detect_schema(df_up)
+                key = cache_put_df(schema["df"], tag=filename)
                 status = f"Loaded file: {filename}\n"
-                return (schema["df"].to_dict("records"),
-                        {"mode": schema["mode"], "states": schema["states"], "signals": schema["signals"]},
-                        status)
-            except Exception as e:
-                default_df = load_default_df()
-                default_schema = detect_schema(default_df)
-                status = f"Failed to parse '{filename}': {e}\nLoaded default data instead."
-                return (default_schema["df"].to_dict("records"),
-                        {"mode": default_schema["mode"], "states": default_schema["states"], "signals": default_schema["signals"]},
-                        status)
-        default_df = load_default_df()
-        default_schema = detect_schema(default_df)
-        status = f"Using default dataset at {DEFAULT_PATH}\nMode: {default_schema['mode']}\nRows: {len(default_schema['df'])}"
-        return (default_schema["df"].to_dict("records"),
+                return (
+                    key,
+                    {"mode": schema["mode"], "states": schema["states"], "signals": schema["signals"]},
+                    status
+                )
+            # default boot
+            default_df = load_default_df()
+            default_schema = detect_schema(default_df)
+            key = cache_put_df(default_schema["df"], tag="default")
+            status = f"Using default dataset at {DEFAULT_PATH}\nMode: {default_schema['mode']}\nRows: {len(default_schema['df'])}"
+            return (
+                key,
                 {"mode": default_schema["mode"], "states": default_schema["states"], "signals": default_schema["signals"]},
-                status)
+                status
+            )
+        except Exception as e:
+            # fail-safe: tiny empty frame to avoid crashing worker
+            tiny = pd.DataFrame({"time_value": pd.to_datetime([]), "geo_value": pd.Series([], dtype="category"), "value": []})
+            key = cache_put_df(tiny, tag="empty")
+            return key, {"mode": "simple", "states": ["uploaded"], "signals": ["value"]}, f"Error: {e}"
 
     @dash_app.callback(
         Output("state-dropdown", "options"),
@@ -531,14 +524,14 @@ def create_app(server, prefix="/app_fft_upload/"):
             return [], None, [], None
         states = schema["states"]
         signals = schema["signals"]
-        return ([{"label": s.upper(), "value": s} for s in states],
+        return ([{"label": str(s).upper(), "value": s} for s in states],
                 (states[0] if states else None),
                 [{"label": s, "value": s} for s in signals],
                 (signals[0] if signals else None))
 
     @dash_app.callback(
         Output("fft-figure", "figure"),
-        Input("data-store", "data"),
+        Input("data-key", "data"),
         Input("schema-store", "data"),
         Input("state-dropdown", "value"),
         Input("signal-dropdown", "value"),
@@ -550,20 +543,25 @@ def create_app(server, prefix="/app_fft_upload/"):
         Input("pdf-logbins", "value"),
         Input("pdf-yaxis-scale", "value"),
     )
-    def update_fft_plot(data_records, schema, state, signal, freq_range, pad_len, pad_side,
+    def update_fft_plot(data_key, schema, state, signal, freq_range, pad_len, pad_side,
                         yaxis_scale, pdf_nbins, pdf_logbins, pdf_yaxis_scale):
-        if not data_records or not schema or state is None or signal is None:
+        if not data_key or not schema or state is None or signal is None:
             return go.Figure().update_layout(title="No data available")
-        df = pd.DataFrame(data_records).copy()
+
+        df = cache_get_df(data_key)
+        if df is None or df.empty:
+            return go.Figure().update_layout(title="No data cached")
+
         if "time_value" not in df.columns or "geo_value" not in df.columns or signal not in df.columns:
             return go.Figure().update_layout(title="Uploaded data missing required columns after normalization.")
-        low_cutoff, high_cutoff = freq_range
+
+        low_cutoff, high_cutoff = (freq_range or [0.001, 0.5])
         return generate_fft_figure(
             df, state, signal,
             pad_length=int(pad_len) if pad_len is not None else 0,
             low_cutoff=float(low_cutoff), high_cutoff=float(high_cutoff),
             filter_type="hard", pad_side=pad_side,
-            yaxis_type=yaxis_scale,
+            yaxis_type=yaxis_scale or "linear",
             pdf_nbins=int(pdf_nbins) if pdf_nbins is not None else 40,
             pdf_logbins=(pdf_logbins == "log"),
             pdf_yaxis_type=pdf_yaxis_scale or "linear"
