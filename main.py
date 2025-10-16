@@ -65,32 +65,44 @@ def create_server():
             </style>
         </head>
         <body>
-          <h1>Spectral Analysis Apps</h1>
-          <p>
-            Our research explores how viral transmission changes over time and what drives those changes.
-            Candidate factors include weather, mobility, demographics, and viral evolution. Some, such as
-            daily temperature or movement patterns, vary rapidly—but whether such fine-scale fluctuations
-            truly shape epidemic dynamics remains uncertain.
-          </p>
-          <p>
-            The time-varying reproductive number, <i>R₀(t)</i>, often looks very different across estimation methods:
-            some curves show smooth seasonal waves, while others oscillate day to day. This raises a key
-            question—are these rapid swings real, or artifacts of how surveillance data are filtered through
-            reporting delays?
-          </p>
-          <p>
-            Observed data such as cases, hospitalizations, and deaths are delayed reflections of infections,
-            each shaped by a reporting-delay distribution that acts as a low-pass filter—preserving long-term
-            trends but suppressing short-term variability. As a result, distinct infection curves can produce
-            nearly identical observed signals, creating a fundamental identifiability problem.
-          </p>
-          <p>
-            These interactive demos quantify how much high-frequency information survives—or is lost—when epidemic
-            signals are filtered by reporting delays. Together, they help reveal which aspects of transmission
-            dynamics can be reliably inferred from data.
-          </p>
-
-          <hr>
+            <h1>Spectral Analysis Apps</h1>
+            
+            <p>
+              Our goal is to understand the drivers of viral transmission and how they evolve over time. Potential drivers include weather variability, human mobility, demographic context, and viral evolution. Some, such as daily temperature, humidity, and mobility flows, are measured at high temporal resolution and capture day-to-day changes. Yet whether such fine-scale fluctuations genuinely translate into observable epidemic impacts—and through what mechanisms—remains uncertain.
+            </p>
+            
+            <p>
+              The time-varying reproductive number, <em>R<sub>0</sub>(t)</em>, is the standard measure of transmissibility, but its estimated trajectories differ widely across methods. Some appear as smooth seasonal waves (e.g., R0-CovidEstim), while others fluctuate sharply on a daily scale (e.g., R0-CU). This discrepancy raises a central question: is the true <em>R<sub>0</sub>(t)</em> inherently volatile, or does the structure of surveillance data make such volatility fundamentally unobservable?
+            </p>
+            
+            <p>
+              Infections themselves are not directly observed. Instead, reported cases, hospitalizations, and deaths are delayed and distorted reflections of infection incidence, each generated through convolution with a reporting-delay distribution. In the frequency domain, such convolutions act as low-pass filters that preserve slow, long-term variations but suppress rapid oscillations. Consequently, even highly dynamic infection processes may appear smoothed in the observed data, creating an identifiability problem in which distinct upstream infection curves yield nearly indistinguishable downstream signals.
+            </p>
+            
+            <p>
+              The main objective of this project is to quantitatively characterize the information loss introduced by reporting delays. Specifically, we aim to:
+            </p>
+            
+            <ul>
+              <li>
+                <strong>Provide a principled analytical framework:</strong>
+                Move beyond qualitative intuition toward a quantitative, frequency-based understanding of the identifiability constraints that shape epidemic inference and model interpretation.
+              </li>
+              <li>
+                <strong>Decompose signals by temporal scale:</strong>
+                Use frequency-domain analysis to separate each signal into its component frequencies, allowing us to assess which temporal scales of variation remain statistically recoverable from observed data.
+              </li>
+              <li>
+                <strong>Measure high-frequency information retention & Quantify information loss:</strong>
+                Evaluate how much of the high-frequency content in epidemic signals survives after being filtered through the reporting-delay distribution, and determine what proportion of variation—particularly in the high-frequency range—is irretrievably lost during convolution, leading to nearly indistinguishable downstream observations.
+              </li>
+              <li>
+                <strong>Incorporate the role of noise:</strong>
+                Noise fundamentally shapes the severity of identifiability constraints. Delay distributions invariably suppress high-frequency components of upstream processes, but the extent to which this matters in practice depends on the signal-to-noise regime of the observed data. At high noise levels, short-period fluctuations in surveillance series are dominated by stochastic variability, making delay-induced attenuation less consequential. By contrast, when noise is moderate, the smoothing imposed by delays becomes the primary source of information loss.
+              </li>
+            </ul>
+            
+            <hr>
 
           <div class="grid">
             <a class="card" href="/app_fft_explorer/">

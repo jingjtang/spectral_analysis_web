@@ -16,12 +16,25 @@ from plotly.subplots import make_subplots
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 
-# =============== Load Confirmed Case Data (AR states file) ===============
-df_full = pd.read_csv("./data/combined_state_no_revision.csv")
-df_full["time_value"] = pd.to_datetime(df_full["time_value"])
-df_full = df_full.dropna(subset=["JHU-Cases"])
-df_full = df_full.sort_values("time_value")
-geo_options = sorted(df_full["geo_value"].unique())
+# =============== Load Confirmed Case Data (memory-friendly) ===============
+CASES_PATH = "./data/combined_state_no_revision.csv"
+
+def _load_cases_df():
+    df = pd.read_csv(
+        CASES_PATH,
+        usecols=["time_value", "geo_value", "JHU-Cases"],  # only what we use
+        dtype={"geo_value": "category", "JHU-Cases": "float32"},  # downcast
+        parse_dates=["time_value"]
+    )
+    df = df.dropna(subset=["JHU-Cases"]).sort_values("time_value")
+    # Optional: pre-aggregate to daily mean per (geo, date) to shrink rows
+    df["time_value"] = df["time_value"].dt.normalize()     # strip time part
+    df = (df.groupby(["geo_value", "time_value"], observed=True)["JHU-Cases"]
+            .mean().reset_index())
+    return df
+
+df_full = _load_cases_df()
+geo_options = list(df_full["geo_value"].cat.categories)
 
 # =============== Helper: Real delay sources =====================
 REAL_SOURCES = {
@@ -31,33 +44,18 @@ REAL_SOURCES = {
 }
 
 def load_real_delay_source(kind: str) -> pd.DataFrame:
-    """
-    Load a real linelist-aggregated delay file with columns:
-      reference_date, report_date, count, delay
-
-    Rules:
-      - Always drop negative delays (Gamma support is [0, inf)).
-      - For 'uscdc' ONLY, also drop delay == 0 (i.e., keep delay > 0).
-      - For other sources, keep delay == 0.
-    """
     path = REAL_SOURCES.get(kind)
     if path is None:
         raise ValueError(f"Unknown real-source: {kind}")
-    df = pd.read_csv(path)
-
-    # Basic normalization
-    df["reference_date"] = pd.to_datetime(df["reference_date"])
-    df["report_date"] = pd.to_datetime(df["report_date"], errors="coerce")
-    df["count"] = df["count"].astype(float)
-    df["delay"] = df["delay"].astype(int)
-
-    # Always remove negative delays
+    df = pd.read_csv(
+        path,
+        usecols=["reference_date", "report_date", "count", "delay"],
+        dtype={"count": "float32", "delay": "int16"},
+        parse_dates=["reference_date", "report_date"]
+    )
     df = df[df["delay"] >= 0].copy()
-
-    # Additional rule for US CDC only: remove delay == 0
     if kind == "uscdc":
         df = df[df["delay"] > 0].copy()
-
     return df
 
 # Cache (simple in-memory) so we don't re-read on every callback
@@ -228,10 +226,6 @@ def tikhonov_deconvolution(observed, delay, lam=0.1):
 
 # =============== Dash App UI =============================================
 def create_app(server, prefix="/app_delay_filtering/"):
-    """
-    在给定 Flask server 上创建并挂载本 Dash 子应用。
-    返回 dash_app 实例。
-    """
     dash_app = Dash(
         __name__,
         server=server,
@@ -328,7 +322,7 @@ def create_app(server, prefix="/app_delay_filtering/"):
         ], style={"width": "75%", "padding": "20px"})
     ], style={"display": "flex", "flexDirection": "row", "flexWrap": "nowrap", "width": "100vw"})
 
-    # ------- Callbacks (注意把装饰器对象改为 dash_app) -------
+    # ------- Callbacks  -------
     @dash_app.callback(
         Output("gamma-controls", "style"),
         Output("real-controls", "style"),
@@ -376,10 +370,10 @@ def create_app(server, prefix="/app_delay_filtering/"):
     def update_figures(n_clicks, geo_value, delay_source, mean, scale,
                        kernel_method, window_days, max_delay, window_end_str,
                        hf_strength, hf_freq, I_thresh=0.1):
-        df = df_full[df_full["geo_value"] == geo_value]
-        df = df.groupby("time_value")["JHU-Cases"].mean().reset_index().sort_values("time_value")
-        confirmed = df["JHU-Cases"].values.astype(float)
-        time = df["time_value"].values
+        mask = (df_full["geo_value"] == geo_value)
+        df_geo = df_full.loc[mask, ["time_value", "JHU-Cases"]].sort_values("time_value")
+        time = df_geo["time_value"].to_numpy(copy=False)
+        confirmed = df_geo["JHU-Cases"].to_numpy(copy=False).astype(np.float32, copy=False)
 
         if delay_source == "synthetic":
             L = min(len(confirmed), (max_delay if max_delay else 60) + 1)
