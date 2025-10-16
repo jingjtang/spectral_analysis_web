@@ -177,121 +177,134 @@ def generate_fft_figure(df, state, signal, pad_length=10,
     return create_fft_plot(full_time, y_plot_original, y_plot_recon,
                            periods, magnitude, signal, state)
 
-# ============== Dash App ==============
-app = Dash(__name__)
-app.title = "FFT Time Series Explorer"
+# ================= Factory App =================
+def create_app(server, prefix="/app_fft_upload/"):
+    dash_app = Dash(
+        __name__,
+        server=server,
+        routes_pathname_prefix=prefix,
+        requests_pathname_prefix=prefix,
+        suppress_callback_exceptions=True,
+        title="FFT Time Series Explorer"
+    )
 
-app.layout = html.Div(style={"display": "flex"}, children=[
+    dash_app.layout = html.Div(style={"display": "flex"}, children=[
 
-    html.Div(style={"width": "28%", "padding": "20px"}, children=[
-        html.H3("Controls"),
-        dcc.Upload(
-            id='upload-data',
-            children=html.Div(['Drag and Drop or ', html.A('Select CSV File')]),
-            style={'width': '100%', 'height': '60px', 'lineHeight': '60px',
-                   'borderWidth': '1px', 'borderStyle': 'dashed',
-                   'borderRadius': '5px', 'textAlign': 'center', 'marginBottom': '15px'},
-            accept='.csv', multiple=False
-        ),
-        html.Div(id='upload-status', style={"fontSize": "12px", "marginBottom": "10px", "whiteSpace": "pre-wrap"}),
-        dcc.Store(id="data-store"),
-        dcc.Store(id="schema-store"),
-        html.P("Workflow: (1) choose frequency band, (2) pad, (3) analyze.",
-               style={"fontSize": "13px", "marginBottom": "10px"}),
-        html.Label("Select State:"), dcc.Dropdown(id="state-dropdown", options=[], value=None, style={"marginBottom": "14px"}),
-        html.Label("Select Signal:"), dcc.Dropdown(id="signal-dropdown", options=[], value=None, style={"marginBottom": "14px"}),
-        html.Label("Frequency Band (Low - High):"),
-        dcc.RangeSlider(id="freq-range", min=0.001, max=0.5, step=0.001, value=[0.001, 0.5],
-                        marks={0.01: "0.01", 0.1: "0.1", 0.3: "0.3", 0.5: "0.5"},
-                        tooltip={"placement": "bottom"}),
-        html.Label("Pad Length (days):"),
-        dcc.Input(id="pad-length", type="number", value=10, min=0, style={"marginBottom": "14px"}),
-        html.Label("Pad Side:"),
-        dcc.Dropdown(id="pad-side",
-                     options=[{"label": "Both", "value": "both"}, {"label": "Left Only", "value": "left"}],
-                     value="both", style={"marginBottom": "14px"}),
-    ]),
+        html.Div(style={"width": "28%", "padding": "20px"}, children=[
+            html.H3("Controls"),
+            dcc.Upload(
+                id='upload-data',
+                children=html.Div(['Drag and Drop or ', html.A('Select CSV File')]),
+                style={'width': '100%', 'height': '60px', 'lineHeight': '60px',
+                       'borderWidth': '1px', 'borderStyle': 'dashed',
+                       'borderRadius': '5px', 'textAlign': 'center', 'marginBottom': '15px'},
+                accept='.csv', multiple=False
+            ),
+            html.Div(id='upload-status', style={"fontSize": "12px", "marginBottom": "10px", "whiteSpace": "pre-wrap"}),
+            dcc.Store(id="data-store"),
+            dcc.Store(id="schema-store"),
+            html.P("Workflow: (1) choose frequency band, (2) pad, (3) analyze.",
+                   style={"fontSize": "13px", "marginBottom": "10px"}),
+            html.Label("Select State:"), dcc.Dropdown(id="state-dropdown", options=[], value=None, style={"marginBottom": "14px"}),
+            html.Label("Select Signal:"), dcc.Dropdown(id="signal-dropdown", options=[], value=None, style={"marginBottom": "14px"}),
+            html.Label("Frequency Band (Low - High):"),
+            dcc.RangeSlider(id="freq-range", min=0.001, max=0.5, step=0.001, value=[0.001, 0.5],
+                            marks={0.01: "0.01", 0.1: "0.1", 0.3: "0.3", 0.5: "0.5"},
+                            tooltip={"placement": "bottom"}),
+            html.Label("Pad Length (days):"),
+            dcc.Input(id="pad-length", type="number", value=10, min=0, style={"marginBottom": "14px"}),
+            html.Label("Pad Side:"),
+            dcc.Dropdown(id="pad-side",
+                         options=[{"label": "Both", "value": "both"}, {"label": "Left Only", "value": "left"}],
+                         value="both", style={"marginBottom": "14px"}),
+        ]),
 
-    html.Div(style={"width": "72%", "padding": "20px"}, children=[
-        html.P("The top plot always shows the mean-removed original (gray) and the mean-removed reconstruction (blue). "
-               "Padding is shown explicitly as zeros on the original curve.",
-               style={"fontSize": "14px", "marginBottom": "10px"}),
+        html.Div(style={"width": "72%", "padding": "20px"}, children=[
+            html.P("The top plot always shows the mean-removed original (gray) and the mean-removed reconstruction (blue). "
+                   "Padding is shown explicitly as zeros on the original curve.",
+                   style={"fontSize": "14px", "marginBottom": "10px"}),
 
-        # 👇 固定高度，避免 Graph 无限自适应撑大页面
-        dcc.Graph(id="fft-figure", style={"height": "750px"})
+            dcc.Graph(id="fft-figure", style={"height": "750px"})
+        ])
     ])
-])
 
-# ============== Callbacks ==============
-@app.callback(
-    Output("data-store", "data"),
-    Output("schema-store", "data"),
-    Output("upload-status", "children"),
-    Input("upload-data", "contents"),
-    State("upload-data", "filename"),
-    prevent_initial_call=False
-)
-def init_or_upload(contents, filename):
-    if contents is not None and filename:
-        try:
-            df_up = parse_uploaded_contents(contents, filename)
-            schema = detect_schema(df_up)
-            status = f"Loaded file: {filename}\n"
-            return (schema["df"].to_dict("records"),
-                    {"mode": schema["mode"], "states": schema["states"], "signals": schema["signals"]},
-                    status)
-        except Exception as e:
-            default_df = load_default_df()
-            default_schema = detect_schema(default_df)
-            status = f"Failed to parse '{filename}': {e}\nLoaded default data instead."
-            return (default_schema["df"].to_dict("records"),
-                    {"mode": default_schema["mode"], "states": default_schema["states"], "signals": default_schema["signals"]},
-                    status)
-    default_df = load_default_df()
-    default_schema = detect_schema(default_df)
-    status = f"Using default dataset at {DEFAULT_PATH}\nMode: {default_schema['mode']}\nRows: {len(default_schema['df'])}"
-    return (default_schema["df"].to_dict("records"),
-            {"mode": default_schema["mode"], "states": default_schema["states"], "signals": default_schema["signals"]},
-            status)
+    # -------- Callbacks --------
+    @dash_app.callback(
+        Output("data-store", "data"),
+        Output("schema-store", "data"),
+        Output("upload-status", "children"),
+        Input("upload-data", "contents"),
+        State("upload-data", "filename"),
+        prevent_initial_call=False
+    )
+    def init_or_upload(contents, filename):
+        if contents is not None and filename:
+            try:
+                df_up = parse_uploaded_contents(contents, filename)
+                schema = detect_schema(df_up)
+                status = f"Loaded file: {filename}\n"
+                return (schema["df"].to_dict("records"),
+                        {"mode": schema["mode"], "states": schema["states"], "signals": schema["signals"]},
+                        status)
+            except Exception as e:
+                default_df = load_default_df()
+                default_schema = detect_schema(default_df)
+                status = f"Failed to parse '{filename}': {e}\nLoaded default data instead."
+                return (default_schema["df"].to_dict("records"),
+                        {"mode": default_schema["mode"], "states": default_schema["states"], "signals": default_schema["signals"]},
+                        status)
+        default_df = load_default_df()
+        default_schema = detect_schema(default_df)
+        status = f"Using default dataset at {DEFAULT_PATH}\nMode: {default_schema['mode']}\nRows: {len(default_schema['df'])}"
+        return (default_schema["df"].to_dict("records"),
+                {"mode": default_schema["mode"], "states": default_schema["states"], "signals": default_schema["signals"]},
+                status)
 
-@app.callback(
-    Output("state-dropdown", "options"),
-    Output("state-dropdown", "value"),
-    Output("signal-dropdown", "options"),
-    Output("signal-dropdown", "value"),
-    Input("schema-store", "data")
-)
-def populate_dropdowns(schema):
-    if not schema:
-        return [], None, [], None
-    states = schema["states"]
-    signals = schema["signals"]
-    return ([{"label": s.upper(), "value": s} for s in states],
-            (states[0] if states else None),
-            [{"label": s, "value": s} for s in signals],
-            (signals[0] if signals else None))
+    @dash_app.callback(
+        Output("state-dropdown", "options"),
+        Output("state-dropdown", "value"),
+        Output("signal-dropdown", "options"),
+        Output("signal-dropdown", "value"),
+        Input("schema-store", "data")
+    )
+    def populate_dropdowns(schema):
+        if not schema:
+            return [], None, [], None
+        states = schema["states"]
+        signals = schema["signals"]
+        return ([{"label": s.upper(), "value": s} for s in states],
+                (states[0] if states else None),
+                [{"label": s, "value": s} for s in signals],
+                (signals[0] if signals else None))
 
-@app.callback(
-    Output("fft-figure", "figure"),
-    Input("data-store", "data"),
-    Input("schema-store", "data"),
-    Input("state-dropdown", "value"),
-    Input("signal-dropdown", "value"),
-    Input("freq-range", "value"),
-    Input("pad-length", "value"),
-    Input("pad-side", "value"),
-)
-def update_fft_plot(data_records, schema, state, signal, freq_range, pad_len, pad_side):
-    if not data_records or not schema or state is None or signal is None:
-        return go.Figure().update_layout(title="No data available")
-    df = pd.DataFrame(data_records).copy()
-    if "time_value" not in df.columns or "geo_value" not in df.columns or signal not in df.columns:
-        return go.Figure().update_layout(title="Uploaded data missing required columns after normalization.")
-    low_cutoff, high_cutoff = freq_range
-    return generate_fft_figure(df, state, signal,
-                               pad_length=int(pad_len) if pad_len is not None else 0,
-                               low_cutoff=float(low_cutoff), high_cutoff=float(high_cutoff),
-                               filter_type="hard", pad_side=pad_side)
+    @dash_app.callback(
+        Output("fft-figure", "figure"),
+        Input("data-store", "data"),
+        Input("schema-store", "data"),
+        Input("state-dropdown", "value"),
+        Input("signal-dropdown", "value"),
+        Input("freq-range", "value"),
+        Input("pad-length", "value"),
+        Input("pad-side", "value"),
+    )
+    def update_fft_plot(data_records, schema, state, signal, freq_range, pad_len, pad_side):
+        if not data_records or not schema or state is None or signal is None:
+            return go.Figure().update_layout(title="No data available")
+        df = pd.DataFrame(data_records).copy()
+        if "time_value" not in df.columns or "geo_value" not in df.columns or signal not in df.columns:
+            return go.Figure().update_layout(title="Uploaded data missing required columns after normalization.")
+        low_cutoff, high_cutoff = freq_range
+        return generate_fft_figure(df, state, signal,
+                                   pad_length=int(pad_len) if pad_len is not None else 0,
+                                   low_cutoff=float(low_cutoff), high_cutoff=float(high_cutoff),
+                                   filter_type="hard", pad_side=pad_side)
 
-if __name__ == "__main__":
-    app.run(debug=False)
+    return dash_app
+
+
+# ============ Optional local debug ============
+# if __name__ == "__main__":
+#     from flask import Flask
+#     server = Flask(__name__)
+#     app = create_app(server, prefix="/app_fft_upload/")
+#     app.run_server(host="0.0.0.0", port=8054, debug=True)

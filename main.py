@@ -3,7 +3,7 @@ import os
 from flask import Flask, render_template_string
 
 from app_delay_filtering.app import create_app as create_delay_app
-# from app_fft_transformation.app import create_app as create_fft_app
+from app_fft_explorer.app import create_app as create_fft_app
 # from app_multiple_delay_filtering.app import create_app as create_multi_app
 
 def create_server():
@@ -34,8 +34,8 @@ def create_server():
               <strong>Delay Filtering</strong>
               <p>delay_filtering</p>
             </a>
-            <a class="card" href="/app_fft_transformation/">
-              <strong>FFT Transformation</strong>
+            <a class="card" href="/app_fft_explorer/">
+              <strong>FFT Explorer</strong>
               <p>fft_transformation</p>
             </a>
             <a class="card" href="/app_multiple_delay_filtering/">
@@ -48,7 +48,7 @@ def create_server():
         """)
 
     create_delay_app(server, prefix="/app_delay_filtering/")
-    # create_fft_app(server,   prefix="/app_fft_transformation/")
+    create_fft_app(server,   prefix="/app_fft_explorer/")
     # create_multi_app(server, prefix="/app_multiple_delay_filtering/")
 
     return server
