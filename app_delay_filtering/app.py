@@ -10,6 +10,15 @@ import plotly.graph_objects as go
 import warnings
 from plotly.subplots import make_subplots
 
+MINI_H = 360
+MINI_MARGIN = dict(t=40, b=30, l=48, r=10)   # extra bottom space for 1-line legend
+LEGEND = dict(
+    orientation="h",
+    x=0.5, xanchor="center",
+    y=-0.30, yanchor="top",                 # push legend below the plot area
+    font=dict(size=12),
+)
+
 # more real data for delay disribution
 # https://opendatasus.saude.gov.br/dataset/srag-2021-a-2024?utm_source=chatgpt.com
 # https://datacatalog.med.nyu.edu/dataset/10438?utm_source=chatgpt.com
@@ -37,6 +46,16 @@ df_full = _load_cases_df()
 geo_options = list(df_full["geo_value"].cat.categories)
 
 # =============== Helper: Real delay sources =====================
+
+# ---- Unified color palette ----
+COLORS = {
+    "confirmed": "#444444",   # deep gray (observed, always)
+    "delay":     "#000000",   # black line
+    "wiener":    "#4C78A8",   # blue
+    "alt":       "#E45756",   # red (you can switch to orange: #F58518)
+    "tikhonov":  "#54A24B",   # green
+}
+
 REAL_SOURCES = {
     "cn30": "./data/cn30_linelist_reporting_delay_from_symptom_onset.csv",
     "uscdc": "./data/uscdc_linelist_reporting_delay_from_symptom_onset.csv",
@@ -224,6 +243,24 @@ def tikhonov_deconvolution(observed, delay, lam=0.1):
     recon[recon < 0] = 0
     return recon
 
+def safe_ratio(num: np.ndarray, den: np.ndarray, eps: float = 1e-12):
+    den2 = np.where(np.abs(den) < eps, eps, den)
+    return num / den2
+
+def compute_psd(series: np.ndarray, dt: float = 1.0):
+    """
+    Return positive frequencies and power spectrum |FFT|^2 for a real series.
+    """
+    x = np.asarray(series, dtype=float)
+    n = len(x)
+    if n < 2:
+        return np.array([]), np.array([])
+    X = fft(x)
+    freqs = fftfreq(n, d=dt)
+    power = np.abs(X) ** 2
+    pos = freqs > 0
+    return freqs[pos], power[pos]
+
 # =============== Dash App UI =============================================
 def create_app(server, prefix="/app_delay_filtering/"):
     dash_app = Dash(
@@ -237,90 +274,154 @@ def create_app(server, prefix="/app_delay_filtering/"):
 
     dash_app.layout = html.Div([
         html.Div([
-            html.H2("Reverse Confirmed Cases to Symptomatic Curve"),
-            html.Label("Select Region:"),
-            dcc.Dropdown(id="geo-dropdown",
-                         options=[{"label": g, "value": g} for g in geo_options],
-                         value=geo_options[0]),
-            html.Br(),
-            html.Label("Delay Source:"),
-            dcc.Dropdown(
-                id="delay-source",
-                options=[
-                    {"label": "Synthetic (Gamma)", "value": "synthetic"},
-                    {"label": "Real (30 Provinces in China linelist)", "value": "cn30"},
-                    {"label": "Real (US CDC linelist)", "value": "uscdc"},
-                    {"label": "Real (Hong Kong linelist)", "value": "hk"},
-                ],
-                value="synthetic"
-            ),
-            html.Div(id="real-source-info", style={"color": "blue", "marginTop": "5px"}),
 
+            # ===== Row 1 =====
             html.Div([
-                html.Label("Gamma Mean:"),
-                dcc.Input(id="mean", type="number", value=5, step=0.1),
-                html.Br(), html.Br(),
-                html.Label("Gamma Scale:"),
-                dcc.Input(id="scale", type="number", value=1, step=0.1),
-            ], id="gamma-controls", style={"marginTop": "8px"}),
+                dcc.Graph(id="result-plot", style={"height": "420px"})
+            ], className="card area-main"),
 
+            # ===== Row 2 =====
+            html.Div([  # subgrid for three mini plots
+                html.Div([dcc.Graph(id="psu-plot", style={"height": f"{MINI_H}px"})], className="mini-card"),
+                html.Div([dcc.Graph(id="delay-plot", style={"height": f"{MINI_H}px"})], className="mini-card"),
+                html.Div([dcc.Graph(id="psd-plot", style={"height": f"{MINI_H}px"})], className="mini-card"),
+            ], className="area-minis minis-subgrid"),
+
+            # ===== Row 3 =====
             html.Div([
-                html.Label("Kernel Method:"),
-                dcc.RadioItems(
-                    id="kernel-method",
-                    options=[
-                        {"label": "Histogram", "value": "hist"},
-                        {"label": "KDE (weighted)", "value": "kde"}
-                    ],
-                    value="hist",
-                    labelStyle={"display": "inline-block", "marginRight": "10px"}
-                ),
-                html.Br(),
-                html.Label("Window length (days, Y):"),
-                dcc.Input(id="window-days", type="number", value=30, min=1, step=1),
-                html.Br(), html.Br(),
-                html.Label("Max delay to consider (days):"),
-                dcc.Input(id="max-delay", type="number", value=60, min=1, step=1),
-                html.Br(), html.Br(),
-                html.Label("Window end date (t):"),
-                dcc.DatePickerSingle(id="window-end",
-                                     display_format="YYYY-MM-DD",
-                                     placeholder="YYYY-MM-DD")
-            ], id="real-controls", style={"display": "none", "marginTop": "8px"}),
+                html.H4("Control Zone", style={"margin": "0 0 8px 0"}),
 
-            html.Br(),
-            html.Label("Amplitude of the Extra High Freq Component"),
-            dcc.Slider(id="hf-strength", min=0, max=3, step=0.1, value=0.5,
-                       tooltip={"placement": "bottom"},
-                       marks={0: "0", 1: "1", 2: "2", 3: "3"},
-                       included=False),
-            html.Br(),
-            html.Label("Freq (cycles/day) of the Extra High Freq Component"),
-            dcc.Slider(id="hf-freq", min=0.05, max=0.5, step=0.01, value=0.25,
-                       tooltip={"placement": "bottom"},
-                       marks={0.05: "0.05", 0.25: "0.25", 0.5: "0.5"},
-                       included=False),
-            html.Br(),
-            html.Label("Influence threshold 𝑰_th"),
-            dcc.Slider(
-                id="influence-thresh",
-                min=0.0, max=1.0, step=0.01, value=0.10,
-                tooltip={"placement": "bottom"},
-                marks={0: "0.00", 0.1: "0.10", 0.25: "0.25", 0.5: "0.50", 0.75: "0.75", 1.0: "1.00"},
-                included=False
-            ),
-            html.Br(),
-            html.Button("Update", id="update-btn", n_clicks=0),
-        ], style={"width": "25%", "padding": "20px"}),
+                html.Div([
+                    html.Div([
+                        html.Div([
+                            html.Label("Select Region:"),
+                            dcc.Dropdown(id="geo-dropdown",
+                                         options=[{"label": g, "value": g} for g in geo_options],
+                                         value=geo_options[0], clearable=False),
 
-        html.Div([
-            dcc.Graph(id="result-plot", style={"height": "400px"}),
-            html.Div([
-                dcc.Graph(id="delay-plot", style={"width": "45%", "height": "380px", "display": "inline-block"}),
-                dcc.Graph(id="fft-plot", style={"width": "53%", "height": "380px", "display": "inline-block"})
-            ])
-        ], style={"width": "75%", "padding": "20px"})
-    ], style={"display": "flex", "flexDirection": "row", "flexWrap": "nowrap", "width": "100vw"})
+                            html.Div(style={"height": "10px"}),
+
+                            html.Label("Amplitude of extra high-freq"),
+                            dcc.Slider(id="hf-strength", min=0, max=3, step=0.1, value=0.5,
+                                       tooltip={"placement": "bottom"},
+                                       marks={0: "0", 1: "1", 2: "2", 3: "3"}, included=False),
+
+                            html.Div(style={"height": "10px"}),
+
+                            html.Label("Frequency (cycles/day) of extra high-freq"),
+                            dcc.Slider(id="hf-freq", min=0.05, max=0.5, step=0.01, value=0.25,
+                                       tooltip={"placement": "bottom"},
+                                       marks={0.05: "0.05", 0.25: "0.25", 0.5: "0.5"}, included=False),
+                        ], className="controls-col"),
+
+                        html.Div([
+                            html.Label("Delay Source:"),
+                            dcc.Dropdown(
+                                id="delay-source",
+                                options=[
+                                    {"label": "Synthetic (Gamma)", "value": "synthetic"},
+                                    {"label": "Real (30 Provinces in China linelist)", "value": "cn30"},
+                                    {"label": "Real (US CDC linelist)", "value": "uscdc"},
+                                    {"label": "Real (Hong Kong linelist)", "value": "hk"},
+                                ],
+                                value="synthetic", clearable=False
+                            ),
+                            html.Div(id="real-source-info", style={"color": "blue", "marginTop": "5px"}),
+
+                            html.Div([
+                                html.Label("Gamma Mean:"),
+                                dcc.Input(id="mean", type="number", value=5, step=0.1, style={"width": "100%"}),
+                                html.Div(style={"height": "8px"}),
+                                html.Label("Gamma Scale:"),
+                                dcc.Input(id="scale", type="number", value=1, step=0.1, style={"width": "100%"}),
+                            ], id="gamma-controls", style={"marginTop": "8px"}),
+
+                            html.Div([
+                                html.Label("Kernel Method:"),
+                                dcc.RadioItems(
+                                    id="kernel-method",
+                                    options=[{"label": "Histogram", "value": "hist"},
+                                             {"label": "KDE (weighted)", "value": "kde"}],
+                                    value="hist",
+                                    labelStyle={"display": "inline-block", "marginRight": "10px"}
+                                ),
+                                html.Div(style={"height": "8px"}),
+                                html.Label("Window length (days, Y):"),
+                                dcc.Input(id="window-days", type="number", value=30, min=1, step=1,
+                                          style={"width": "100%"}),
+                                html.Div(style={"height": "8px"}),
+                                html.Label("Max delay to consider (days):"),
+                                dcc.Input(id="max-delay", type="number", value=60, min=1, step=1,
+                                          style={"width": "100%"}),
+                                html.Div(style={"height": "8px"}),
+                                html.Label("Window end date (t):"),
+                                dcc.DatePickerSingle(id="window-end", display_format="YYYY-MM-DD",
+                                                     placeholder="YYYY-MM-DD")
+                            ], id="real-controls", style={"display": "none", "marginTop": "8px"}),
+                        ], className="controls-col"),
+                    ], className="controls-left-grid"),
+                    html.Div([
+                        html.Button("Update", id="update-btn", n_clicks=0, style={"width": "100%"})
+                    ], style={"marginTop": "4px"}),
+
+                ], className="controls-outer-grid"),
+
+            ], className="card area-controls"),
+
+        ], className="grid-root")
+    ], style={"padding": "12px"})
+
+    # ---- Minimal CSS (inline style tags or external asset) ----
+    dash_app.index_string = dash_app.index_string.replace(
+        "</head>",
+        """
+        <style>
+        /* ===== Top-level grid ===== */
+        .grid-root {
+          display: grid;
+          grid-template-columns: 1fr;
+          grid-template-rows: auto auto auto;
+          grid-template-areas:
+            "main"
+            "minis"
+            "controls";
+          gap: 12px;
+          
+          max-width: 1500px;   
+          margin: 0 auto;      
+          padding: 8px 12px;  
+        }
+        .area-main     { grid-area: main; }
+        .area-minis    { grid-area: minis; }
+        .area-controls { grid-area: controls; }
+        
+        /* minis */
+        .minis-subgrid {
+          display: grid;
+          grid-template-columns: 1fr 1fr 1fr;
+          gap: 12px;
+        }
+        .card { background:#fff; padding:10px; border-radius:10px; box-shadow:0 1px 3px rgba(0,0,0,0.08); }
+        .mini-card { background:#fff; padding:6px; border-radius:10px; box-shadow:0 1px 3px rgba(0,0,0,0.08); }
+        
+        /* ===== Control Zone ===== */
+        .controls-outer-grid {
+          display: grid;
+          grid-template-columns: 1fr;   /* single column now */
+          gap: 16px;
+          align-items: start;
+        }
+        .controls-left-grid {
+          display: grid;
+          grid-template-columns: 1fr 1fr;  /* keep your two control columns */
+          gap: 16px;
+        }
+        .controls-grid { display:grid; grid-template-columns: 1fr 1fr; gap:16px; }
+        .controls-col  { display:flex; flex-direction:column; }
+        </style>
+        </head>
+        """
+    )
 
     # ------- Callbacks  -------
     @dash_app.callback(
@@ -352,10 +453,11 @@ def create_app(server, prefix="/app_delay_filtering/"):
 
     @dash_app.callback(
         Output("result-plot", "figure"),
+        Output("psu-plot", "figure"),
         Output("delay-plot", "figure"),
-        Output("fft-plot", "figure"),
+        Output("psd-plot", "figure"),
         Input("update-btn", "n_clicks"),
-        State("geo-dropdown", "value"),
+        Input("geo-dropdown", "value"),
         State("delay-source", "value"),
         State("mean", "value"),
         State("scale", "value"),
@@ -365,11 +467,11 @@ def create_app(server, prefix="/app_delay_filtering/"):
         State("window-end", "date"),
         State("hf-strength", "value"),
         State("hf-freq", "value"),
-        State("influence-thresh", "value"),
     )
-    def update_figures(n_clicks, geo_value, delay_source, mean, scale,
+    def update_figures(n_clicks, _trigger_geo, delay_source, mean, scale,
                        kernel_method, window_days, max_delay, window_end_str,
-                       hf_strength, hf_freq, I_thresh=0.1):
+                       hf_strength, hf_freq):
+        geo_value = _trigger_geo
         mask = (df_full["geo_value"] == geo_value)
         df_geo = df_full.loc[mask, ["time_value", "JHU-Cases"]].sort_values("time_value")
         time = df_geo["time_value"].to_numpy(copy=False)
@@ -403,6 +505,13 @@ def create_app(server, prefix="/app_delay_filtering/"):
             delay_kernel = delay_kernel[:len(confirmed)]
             delay_kernel = delay_kernel / delay_kernel.sum() if delay_kernel.sum() > 0 else delay_kernel
 
+        # --- Delay spectrum (make available for mini-plot) ---
+        delay_fft_complex = fft(delay_kernel)
+        A = np.abs(delay_fft_complex)
+        A2 = A ** 2  # |G(f)|^2 (power response of delay)
+        freqs = fftfreq(len(delay_kernel), d=1.0)
+        pos = freqs > 0  # positive frequencies only
+
         wiener_curve = wiener_deconvolution(confirmed, delay_kernel)
 
         freq = hf_freq
@@ -422,96 +531,139 @@ def create_app(server, prefix="/app_delay_filtering/"):
         tikhonov_reconv = reconvolve_linear(tikhonov_curve, delay_kernel, out_len=len(confirmed))
         rmse_tikh = rmse(confirmed, tikhonov_reconv)
 
-        delay_fft_complex = fft(delay_kernel)
-        A = np.abs(delay_fft_complex)
-        A2 = A**2
-        freqs = fftfreq(len(delay_kernel), d=1.0)
-        pos = freqs > 0
-
-        lambda_base = estimate_lambda_from_residuals(confirmed, wiener_reconv)
-        lambda_alt  = estimate_lambda_from_residuals(confirmed, altered_reconv)
-        lambda_tikh2 = estimate_lambda_from_residuals(confirmed, tikhonov_reconv)
-
-        H_tikh = A2 / (A2 + lambda_tikh2)
-        influence_base = A2 / (A2 + lambda_base)
-        influence_alt  = A2 / (A2 + lambda_alt)
-
-        f_cut_base = f_cut_alt = f_cut_tikh = None
-        P_cut_base = P_cut_alt = P_cut_tikh = None
-        if np.any(pos):
-            fpos = freqs[pos]
-            def first_cut(I):
-                idx = np.where(I[pos] < I_thresh)[0]
-                if idx.size > 0:
-                    f = float(fpos[idx[0]])
-                    return f, (1.0 / f) if f > 0 else np.inf
-                return None, None
-            f_cut_base, P_cut_base = first_cut(influence_base)
-            f_cut_alt,  P_cut_alt  = first_cut(influence_alt)
-            f_cut_tikh, P_cut_tikh = first_cut(H_tikh)
-
+        # ----- 1) MAIN TIME-DOMAIN FIG -----
         fig_main = go.Figure()
-        fig_main.add_trace(go.Scatter(x=time, y=confirmed, mode='lines', name='Confirmed Cases'))
-        fig_main.add_trace(go.Scatter(x=time, y=wiener_curve, mode='lines', name='Wiener deconv Symptomatic'))
-        fig_main.add_trace(go.Scatter(x=time, y=wiener_reconv, mode='lines', line=dict(dash='dash'),
-                                      name=f'Wiener re-conv (RMSE {rmse_wiener:.1f})'))
-        fig_main.add_trace(go.Scatter(x=time, y=altered_infection, mode='lines', name='Alt Symptomatic (+hi-freq)'))
-        fig_main.add_trace(go.Scatter(x=time, y=altered_reconv, mode='lines', line=dict(dash='dot'),
-                                      name=f'Alt reconv (RMSE {rmse_altered:.1f})'))
-        fig_main.add_trace(go.Scatter(x=time, y=tikhonov_curve, mode='lines',
-                                      line=dict(color='green'),
-                                      name=f'Tikhonov deconv Symptomatic (λ={lambda_tikh:.3g})'))
-        fig_main.add_trace(go.Scatter(x=time, y=tikhonov_reconv, mode='lines',
-                                      line=dict(color='green', dash='dash'),
-                                      name=f'Tikhonov re-conv (RMSE {rmse_tikh:.1f})'))
-        fig_main.update_layout(title=f"US Infection Reconstruction in {geo_value.upper()} — The raw vs. Wiener vs. Altered",
-                               xaxis_title="Date", yaxis_title="Cases", height=400,
+        fig_main.add_trace(go.Scatter(
+            x=time, y=confirmed, mode='lines', name='Confirmed Cases',
+            line=dict(color=COLORS["confirmed"])
+        ))
+
+        # Wiener pair (solid symptomatic, dashed reconv)
+        fig_main.add_trace(go.Scatter(
+            x=time, y=wiener_curve, mode='lines',
+            name='Up-Wiener',
+            line=dict(color=COLORS["wiener"])
+        ))
+        fig_main.add_trace(go.Scatter(
+            x=time, y=wiener_reconv, mode='lines',
+            name=f'Down-Wiener (RMSE {rmse_wiener:.1f})',
+            line=dict(color=COLORS["wiener"], dash='dash')
+        ))
+
+        # Alt pair
+        fig_main.add_trace(go.Scatter(
+            x=time, y=altered_infection, mode='lines',
+            name='Up-Wiener Alt (+hi-freq)',
+            line=dict(color=COLORS["alt"])
+        ))
+        fig_main.add_trace(go.Scatter(
+            x=time, y=altered_reconv, mode='lines',
+            name=f'Down-Wiener Alt (RMSE {rmse_altered:.1f})',
+            line=dict(color=COLORS["alt"], dash='dash')
+        ))
+
+        # Tikhonov pair
+        fig_main.add_trace(go.Scatter(
+            x=time, y=tikhonov_curve, mode='lines',
+            name=f'Up-Tikhonov (λ={lambda_tikh:.3g})',
+            line=dict(color=COLORS["tikhonov"])
+        ))
+        fig_main.add_trace(go.Scatter(
+            x=time, y=tikhonov_reconv, mode='lines',
+            name=f'Down-Tikhonov (RMSE {rmse_tikh:.1f})',
+            line=dict(color=COLORS["tikhonov"], dash='dash')
+        ))
+        fig_main.update_layout(title="Upstream vs Downstream: Time-Series Comparison",
+                               xaxis_title="Date", yaxis_title="Cases", height=420,
                                legend=dict(orientation="h", yanchor="bottom", y=-0.7, xanchor="center", x=0.5),
                                margin=dict(t=100))
 
-        grid = np.arange(len(delay_kernel))
-        fig_delay = go.Figure()
-        fig_delay.add_trace(go.Scatter(x=grid, y=delay_kernel, mode='lines', name="Delay kernel"))
-        fig_delay.update_layout(title=f"Delay Distribution<br> — {label}{gamma_fit_txt}",
-                                xaxis_title="Delay (days)", yaxis_title="Probability", height=400)
+        # ----- 2) PSU (Upstream power spectrum of symptomatic curves) -----
+        # Upstream = symptomatic reconstructions: wiener_curve, altered_infection, tikhonov_curve
+        f_wu, P_wu = compute_psd(wiener_curve)
+        f_au, P_au = compute_psd(altered_infection)
+        f_tu, P_tu = compute_psd(tikhonov_curve)
 
-        fig_fft = make_subplots(specs=[[{"secondary_y": True}]])
-        fig_fft.add_trace(go.Scatter(x=freqs[pos], y=A2[pos], mode='lines', name="Delay power |G(f)|²"),
-                          secondary_y=False)
-        fig_fft.add_trace(go.Scatter(x=freqs[pos], y=influence_base[pos], mode='lines',
-                                     name="Influence I(f) — baseline", line=dict(color="red")),
-                          secondary_y=True)
-        fig_fft.add_trace(go.Scatter(x=freqs[pos], y=influence_alt[pos], mode='lines',
-                                     name="Influence I(f) — altered", line=dict(color="orange")),
-                          secondary_y=True)
-        fig_fft.add_trace(go.Scatter(x=freqs[pos], y=H_tikh[pos], mode='lines',
-                                     name="Tikhonov S(f)", line=dict(color="green")),
-                          secondary_y=True)
+        fig_psu = go.Figure()
+        # shorter labels → less chance to wrap
+        if f_wu.size: fig_psu.add_trace(go.Scatter(x=f_wu, y=P_wu, mode="lines",
+                                                   name="PSu-Wiener", line=dict(color=COLORS["wiener"])))
+        if f_au.size: fig_psu.add_trace(go.Scatter(x=f_au, y=P_au, mode="lines",
+                                                   name="PSu-Wiener Alt", line=dict(color=COLORS["alt"])))
+        if f_tu.size: fig_psu.add_trace(go.Scatter(x=f_tu, y=P_tu, mode="lines",
+                                                   name="PSu-Tikhonov", line=dict(color=COLORS["tikhonov"])))
 
-        def add_cut(fig, f_val, color, label):
-            if f_val is None or not np.isfinite(f_val): return
-            fig.add_trace(go.Scatter(x=[f_val, f_val], y=[0, 1], mode="lines",
-                                     line=dict(color=color, dash="dash", width=2),
-                                     name=label, yaxis="y2"), secondary_y=True)
-
-        if f_cut_base: add_cut(fig_fft, f_cut_base, "red",   f"f_cut(base)≈{f_cut_base:.3f} (P≈{P_cut_base:.1f}d)")
-        if f_cut_alt:  add_cut(fig_fft, f_cut_alt,  "orange",f"f_cut(alt)≈{f_cut_alt:.3f} (P≈{P_cut_alt:.1f}d)")
-        if f_cut_tikh: add_cut(fig_fft, f_cut_tikh, "green", f"f_cut(tikh)≈{f_cut_tikh:.3f} (P≈{P_cut_tikh:.1f}d)")
-
-        fig_fft.update_layout(
-            title="Delay Spectrum & SNR-aware Influence",
-            height=400,
-            legend=dict(orientation="h", yanchor="top", y=-0.7, xanchor="center", x=0.5),
-            margin=dict(t=80, b=80)
+        fig_psu.update_layout(
+            title="PSu(f) · Upstream Power Spectrum",
+            xaxis_title="Frequency (cycles/day)", yaxis_title="Power",
+            height=MINI_H, margin=MINI_MARGIN, legend=LEGEND
         )
-        details_lines = [f"λ_base≈{lambda_base:.3g}, λ_alt≈{lambda_alt:.3g}, λ_tikh≈{lambda_tikh2:.3g}"]
-        fig_fft.add_annotation(x=0.5, y=1.35, xref="paper", yref="paper",
-                               text="<br>".join(details_lines), showarrow=False,
-                               xanchor="center", font=dict(size=15))
-        fig_fft.update_xaxes(title_text="Frequency (cycles/day)")
-        fig_fft.update_yaxes(title_text="Power |G(f)|²", secondary_y=False)
-        fig_fft.update_yaxes(title_text="Influence I(f)", range=[0, 1], secondary_y=True)
 
-        return fig_main, fig_delay, fig_fft
+        # ----- 3) Delay Spectrum (|G(f)|^2) with secondary axis for 100·(1 - |G(f)|^2) -----
+        from plotly.subplots import make_subplots
+
+        fig_delay = make_subplots(specs=[[{"secondary_y": True}]])
+
+        if np.any(pos):
+            fpos = freqs[pos]
+            G2 = A2[pos]  # |G(f)|^2
+            att = 100.0 * (1.0 - G2)  # 100·(1 - |G(f)|^2)
+
+            # Left y-axis: power response |G(f)|^2
+            fig_delay.add_trace(
+                go.Scatter(x=fpos, y=G2, mode="lines",
+                           name="|G(f)|² (delay power)",
+                           line=dict(color=COLORS["delay"])),
+                secondary_y=False
+            )
+
+            # Right y-axis: percent attenuation 100·(1 - |G(f)|^2)
+            fig_delay.add_trace(
+                go.Scatter(x=fpos, y=att, mode="lines",
+                           name="100·(1 − |G(f)|²)",
+                           line=dict(dash="dash")),
+                secondary_y=True
+            )
+
+        fig_delay.update_layout(
+            title="Delay Spectrum · |G(f)|²  &  100·(1 − |G(f)|²)",
+            height=MINI_H, margin=MINI_MARGIN, legend=LEGEND
+        )
+        fig_delay.update_xaxes(title_text="Frequency (cycles/day)")
+        fig_delay.update_yaxes(title_text="Power |G(f)|²", range=[0, 1], secondary_y=False)
+        fig_delay.update_yaxes(title_text="Attenuation (%)", range=[0, 100], secondary_y=True)
+
+
+        # ----- 4) PSD (Downstream power spectrum of confirmed + reconv curves) -----
+        # Downstream = confirmed cases & reconvolved curves
+        f_c, P_c = compute_psd(confirmed)
+        f_wd, P_wd = compute_psd(wiener_reconv)
+        f_ad, P_ad = compute_psd(altered_reconv)
+        f_td, P_td = compute_psd(tikhonov_reconv)
+
+        fig_psd = go.Figure()
+        if f_c.size:
+            fig_psd.add_trace(go.Scatter(x=f_c, y=P_c, mode="lines",
+                                         name="PS-Confirmed (obs.)",
+                                         line=dict(color=COLORS["confirmed"])))
+        if f_wd.size:
+            fig_psd.add_trace(go.Scatter(x=f_wd, y=P_wd, mode="lines",
+                                         name="PSd-Wiener", line=dict(color=COLORS["wiener"])))
+        if f_ad.size:
+            fig_psd.add_trace(go.Scatter(x=f_ad, y=P_ad, mode="lines",
+                                         name="PSd-Wiener Alt", line=dict(color=COLORS["alt"])))
+        if f_td.size:
+            fig_psd.add_trace(go.Scatter(x=f_td, y=P_td, mode="lines",
+                                         name="PSd-Tikhonov", line=dict(color=COLORS["tikhonov"])))
+
+        fig_psd.update_layout(
+            title="PSd(f) · Downstream Power Spectrum",
+            xaxis_title="Frequency (cycles/day)", yaxis_title="Power",
+            height=MINI_H, margin=MINI_MARGIN, legend=LEGEND
+        )
+
+
+        # ----- Return all five figures -----
+        return fig_main, fig_psu, fig_delay, fig_psd
 
     return dash_app
