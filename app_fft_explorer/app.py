@@ -229,107 +229,156 @@ def bin_energy_pdf(pdf_freqs, pdf_vals, nbins=50, use_log=False):
 
 def create_fft_plot(
     full_time, y_plot_original, y_plot_recon,
-    freqs_power, power, signal, state, yaxis_type="linear",
+    x_vals_all, power_all,            # full-spectrum x and power (light-green background)
+    x_vals_display, power_display,    # filtered spectrum (kept for potential future use)
+    band_mask,                        # boolean mask on x_vals_all
+    xaxis_label,                      # "Frequency (cycles/day)" or "Period (days)"
+    signal, state, yaxis_type="linear",
     frac_info=None,
-    pdf_freqs=None, pdf_vals=None, cdf_vals=None, df_bin=1.0,
-    band_mask_pdf=None,
-    pdf_binned_freqs=None, pdf_binned_vals=None, pdf_yaxis_type="linear",
-    H_total=None, H_band=None, H_norm=None, band_share=None
 ):
-    subtitle_power = "FFT Amplitude Spectrum (Frequency Domain)"
+    """
+    Render two subplots:
+      Row 1: Time-domain (original vs reconstructed), with an internal top-right legend.
+      Row 2: Power spectrum (full background in light green; selected band overlay in dark green),
+             with an internal top-right legend. X-axis can be frequency or period.
+    Notes:
+      - Global legend is disabled; we draw internal legends via shapes + annotations.
+      - All comments are in English as requested.
+    """
+    subtitle_power = "Power Spectrum (|FFT|², full)"
     if frac_info is not None:
         subtitle_power += f"<br> — Selected Band Energy = {frac_info:.1%}"
 
-    ent_bits = []
-    if H_total is not None: ent_bits.append(f"H={H_total:.3f}")
-    if H_norm  is not None: ent_bits.append(f"H_norm={H_norm:.3f}")
-    if band_share is not None: ent_bits.append(f"Entropy Fraction={band_share:.1%}")
-    subtitle_pdf = "Energy PDF (bars, binned) & CDF (line)<br>" + (" - " + " ".join(ent_bits) if ent_bits else "")
-
     fig = make_subplots(
-        rows=2, cols=2,
-        specs=[[{"colspan": 2}, None],[{}, {"secondary_y": True}]],
-        vertical_spacing=0.15, horizontal_spacing=0.1,
-        # subplot_titles=[
-        #     "Time-Domain Signal (Original vs Reconstructed)",
-        #     "Power Spectrum (After Filtering)",
-        #     "Energy PDF & CDF (Positive Frequencies)"
-        # ]
+        rows=2, cols=1,
+        specs=[[{}], [{}]],
+        vertical_spacing=0.12
     )
-    # --- Row 1: Time series (figure 1) ---
-    fig.add_trace(go.Scatter(x=full_time, y=y_plot_original,
-                             name="Original (mean-removed)",
-                             line=dict(color="gray"),
-                             showlegend=True
-                  ),
-                  row=1, col=1)
-    fig.add_trace(go.Scatter(x=full_time, y=y_plot_recon,
-                             name="Reconstructed (filtered, mean-removed)",
-                             line=dict(color="blue"),
-                             showlegend=True
-                  ),
-                  row=1, col=1)
-    # --- Row 2, Col 1: Power (figure 2) ---
-    order = np.argsort(freqs_power)
-    f2 = freqs_power[order]; P2 = power[order]
-    widths = (np.full_like(f2, float(np.mean(np.diff(f2)))) if len(f2) > 1 else np.array([0.0]))
-    fig.add_trace(go.Bar(x=f2, y=P2, width=widths,
-                         marker=dict(color='rgba(0,128,0,0.4)'),
-                         name="Power",
-                         showlegend=False
-                  ),
-                  row=2, col=1)
-    fig.add_trace(go.Scatter(x=f2, y=P2, mode='markers',
-                             marker=dict(size=4, color='green'),
-                             showlegend=False),
-                  row=2, col=1)
 
-    if pdf_binned_freqs is not None and len(pdf_binned_freqs) > 0 and pdf_binned_vals is not None:
-        x_pdf = pdf_binned_freqs; y_pdf = pdf_binned_vals
-        if len(x_pdf) > 1:
-            edges = np.zeros(len(x_pdf) + 1, dtype=float)
-            edges[1:-1] = 0.5 * (x_pdf[:-1] + x_pdf[1:])
-            edges[0]  = x_pdf[0]  - (edges[1] - x_pdf[0])
-            edges[-1] = x_pdf[-1] + (x_pdf[-1] - edges[-2])
-            widths_pdf = edges[1:] - edges[:-1]
-        else:
-            widths_pdf = np.array([df_bin])
-        fig.add_trace(go.Bar(x=x_pdf, y=y_pdf, width=widths_pdf,
-                             name="Energy PDF p(f) (binned)",
-                             marker=dict(color='rgba(0,0,255,0.45)'),
-                             showlegend=False),
-                      row=2, col=2, secondary_y=False)
+    # ===== Row 1: Time-domain traces (disable global legend) =====
+    fig.add_trace(go.Scatter(
+        x=full_time, y=y_plot_original,
+        name="Original",
+        line=dict(color="gray"),
+        showlegend=False
+    ), row=1, col=1)
 
-    if cdf_vals is not None and pdf_freqs is not None and len(pdf_freqs) == len(cdf_vals):
-        fig.add_trace(go.Scatter(x=pdf_freqs, y=cdf_vals, mode='lines+markers',
-                                 name="CDF (cumulative energy share)",
-                                 showlegend=False),
-                      row=2, col=2, secondary_y=True)
+    fig.add_trace(go.Scatter(
+        x=full_time, y=y_plot_recon,
+        name="Reconstructed",
+        line=dict(color="blue"),
+        showlegend=False
+    ), row=1, col=1)
 
-    if band_mask_pdf is not None and pdf_freqs is not None and len(pdf_freqs) > 0 and band_mask_pdf.any():
-        fig.add_vline(x=float(pdf_freqs[band_mask_pdf].min()), line=dict(color="red", dash="dash"), row=2, col=2)
-        fig.add_vline(x=float(pdf_freqs[band_mask_pdf].max()), line=dict(color="red", dash="dash"), row=2, col=2)
+    # ===== Row 2: Power spectrum (two-layer bars) =====
+    # Sort by x for proper bar ordering
+    order_all = np.argsort(x_vals_all)
+    xa = np.asarray(x_vals_all)[order_all]
+    Pa = np.asarray(power_all)[order_all]
 
+    # Light green: full spectrum
+    widths = (np.full_like(xa, float(np.mean(np.diff(xa)))) if len(xa) > 1 else np.array([0.0]))
+    fig.add_trace(go.Bar(
+        x=xa, y=Pa, width=widths,
+        marker=dict(color='rgba(0,128,0,0.35)'),
+        name="Power (full, |FFT|²)",
+        showlegend=False
+    ), row=2, col=1)
+
+    # Dark green overlay: selected band
+    band_overlay = None
+    if band_mask is not None and np.any(band_mask):
+        mask_sorted = np.asarray(band_mask)[order_all]
+        fig.add_trace(go.Bar(
+            x=xa[mask_sorted], y=Pa[mask_sorted],
+            width=widths[mask_sorted],
+            marker=dict(color='rgba(0,128,0,0.95)'),
+            name="Selected band",
+            showlegend=False
+        ), row=2, col=1)
+
+    # ===== Axes and layout =====
     fig.update_xaxes(title_text="Time", row=1, col=1)
-    fig.update_xaxes(title_text="Frequency (cycles/day)", row=2, col=1)
-    fig.update_yaxes(title_text="Power", type=yaxis_type, row=2, col=1)
-    fig.update_xaxes(title_text="Frequency (cycles/day)", row=2, col=2)
-    fig.update_yaxes(title_text="PDF p(f)", type=pdf_yaxis_type, row=2, col=2, secondary_y=False)
-    fig.update_yaxes(title_text="CDF", range=[0, 1], row=2, col=2, secondary_y=True)
+    fig.update_xaxes(title_text=xaxis_label, row=2, col=1)
+    fig.update_yaxes(title_text="Power (|FFT|²)", type=yaxis_type, row=2, col=1)
 
     fig.update_layout(
         height=750,
         title=f"{signal} in {state} — FFT Analysis",
-        showlegend=True,
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-        annotations=[
-            dict(text="Time-Domain Signal (Original vs Reconstructed)", xref="paper", yref="paper",
-                 x=0.0, y=1.08, showarrow=False, font=dict(size=13)),
-            dict(text=subtitle_power, xref="paper", yref="paper", x=0.12, y=0.46, showarrow=False, font=dict(size=12)),
-            dict(text=subtitle_pdf, xref="paper", yref="paper", x=0.88, y=0.46, showarrow=False,
-                 font=dict(size=12), xanchor="right")
-        ]
+        margin=dict(t=80, r=20, l=60, b=60),
+        showlegend=False
     )
+
+    # ===== Internal top-right legends for each subplot (C1: semi-transparent white bg; M font) =====
+    def add_internal_legend_topright(fig, xdomain, ydomain, items,
+                                     box_pad=0.010, row_gap=0.075,
+                                     swatch_w=0.020, swatch_h=0.040,
+                                     font_size=12, with_bg=True):
+        """
+        Draw a compact "journal-style" legend inside top-right of a given subplot domain.
+        """
+        x1 = xdomain[1] - box_pad
+        y1 = ydomain[1] - box_pad
+        for i, (label, color) in enumerate(items):
+            y_top = y1 - i * row_gap
+            # color swatch
+            fig.add_shape(
+                type="rect",
+                xref="paper", yref="paper",
+                x0=x1 - swatch_w, x1=x1,
+                y0=y_top - swatch_h, y1=y_top,
+                line=dict(width=0.5, color="rgba(0,0,0,0.25)"),
+                fillcolor=color,
+                layer="above",
+            )
+            # text label
+            fig.add_annotation(
+                xref="paper", yref="paper",
+                x=(x1 - swatch_w - 0.006),
+                y=(y_top - swatch_h / 2.0),
+                text=label,
+                showarrow=False,
+                xanchor="right",
+                yanchor="middle",
+                font=dict(size=font_size),
+                bgcolor=("rgba(255,255,255,0.70)" if with_bg else None),
+                bordercolor=("rgba(0,0,0,0.25)" if with_bg else None),
+                borderwidth=(0.5 if with_bg else 0),
+                align="left",
+                opacity=0.98,
+            )
+
+    # Domains for precise placement
+    x1d = tuple(fig.layout.xaxis.domain)
+    y1d = tuple(fig.layout.yaxis.domain)
+    x2d = tuple(fig.layout.xaxis2.domain)
+    y2d = tuple(fig.layout.yaxis2.domain)
+
+    # Subplot 1 legend (top-right)
+    add_internal_legend_topright(
+        fig, x1d, y1d,
+        items=[("Original", "gray"), ("Reconstructed", "blue")],
+        font_size=12, with_bg=True
+    )
+
+    # Subplot 2 legend (top-right)
+    add_internal_legend_topright(
+        fig, x2d, y2d,
+        items=[("Power (full, |FFT|²)", "rgba(0,128,0,0.35)"),
+               ("Selected band", "rgba(0,128,0,0.95)")],
+        font_size=12, with_bg=True
+    )
+
+    # Optional subtitle above subplot 2
+    fig.add_annotation(
+        xref="paper", yref="paper",
+        x=x2d[0], y=y2d[1] + 0.02,
+        text=subtitle_power,
+        showarrow=False,
+        xanchor="left", yanchor="bottom",
+        font=dict(size=12)
+    )
+
     return fig
 
 def generate_fft_figure(
@@ -337,21 +386,32 @@ def generate_fft_figure(
     low_cutoff=0.01, high_cutoff=0.5,
     filter_type="hard", pad_side="both",
     yaxis_type="linear",
-    pdf_nbins=40, pdf_logbins=False, pdf_yaxis_type="linear"
+    xaxis_mode="frequency",
 ):
+    """
+    Build the FFT figure with:
+      - Row 1: time-domain original vs reconstructed
+      - Row 2: power spectrum (full vs selected band)
+    The spectrum x-axis can be 'frequency' (default) or 'period'; when 'period', we plot 1/f.
+    """
     y_raw, t_raw, y_mean = extract_signal(df, state, signal)
     if y_raw is None:
         return go.Figure().update_layout(title="No data available")
 
-    # 先截断/抽稀，再做 FFT（极大降低内存和计算）
+    # Reduce points for speed/memory
     t_raw, y_raw = _truncate_and_decimate(t_raw, y_raw, max_points=5000)
 
+    # Mean-removal for FFT
     y_for_fft = (y_raw - y_mean).astype("float32", copy=False)
+
+    # Zero-padding for FFT
     y_padded_fft, full_time = preprocess_signal(y_for_fft, t_raw, int(pad_length or 0), pad_side)
     y_plot_original = pad_for_plot(y_for_fft, int(pad_length or 0), pad_side)
 
+    # rFFT
     freqs_full, fft_vals_full = compute_fft(y_padded_fft)
 
+    # Compute band energy fraction on positive frequencies (for subtitle)
     spectrum_full = np.abs(fft_vals_full) ** 2
     pos_mask_full = freqs_full > 0
     freqs_pos_all = freqs_full[pos_mask_full]
@@ -361,39 +421,49 @@ def generate_fft_figure(
     band_energy = float(np.sum(spectrum_pos_all[band_mask])) if total_energy > 0 else 0.0
     frac_energy = band_energy / total_energy if total_energy > 0 else 0.0
 
-    pdf_freqs, pdf_vals, cdf_vals, df_bin = compute_energy_distribution(freqs_full, fft_vals_full)
-    band_mask_pdf = (pdf_freqs >= low_cutoff) & (pdf_freqs <= high_cutoff) if len(pdf_freqs) else None
-    H_total, H_band, H_norm, band_share = entropy_from_pdf(pdf_vals, mask=band_mask_pdf)
-
-    pdf_binned_freqs, pdf_binned_vals, _ = bin_energy_pdf(
-        pdf_freqs, pdf_vals, nbins=int(pdf_nbins or 40), use_log=bool(pdf_logbins)
-    )
-
+    # Hard-band filter in frequency domain
     filtered_fft_vals = apply_frequency_filter(freqs_full, fft_vals_full,
                                                float(low_cutoff), float(high_cutoff),
                                                method=filter_type)
     recon_signal = np.real(irfft(filtered_fft_vals, n=len(y_padded_fft))).astype("float32", copy=False)
     y_plot_recon = recon_signal
 
+    # Positive-frequency power spectrum for plotting
     freqs_pos_display, power_display = compute_power_spectrum(freqs_full, filtered_fft_vals)
+    # We also need the full-spectrum power (unfiltered) to show as the light-green base
+    _, power_full_pos = compute_power_spectrum(freqs_full, fft_vals_full)
 
-    # Plotly 日期要字符串
+    # Select x-axis array and label for subplot 2
+    if (xaxis_mode or "frequency") == "period":
+        # Convert frequency to period (days). Avoid division by zero by using pos freqs only.
+        x_vals_all = 1.0 / freqs_pos_all
+        x_vals_display = 1.0 / freqs_pos_display
+        x_label = "Period (days)"
+    else:
+        x_vals_all = freqs_pos_all
+        x_vals_display = freqs_pos_display
+        x_label = "Frequency (cycles/day)"
+
+    # Prepare band mask aligned with x_vals_all
+    band_mask_for_plot = band_mask
+
+    # Convert timeline to strings for Plotly
     full_time_str = pd.to_datetime(full_time).strftime("%Y-%m-%d")
 
+    # Render
     return create_fft_plot(
         full_time=full_time_str,
         y_plot_original=y_plot_original,
         y_plot_recon=y_plot_recon,
-        freqs_power=freqs_pos_display,
-        power=power_display,
+        x_vals_all=x_vals_all,              # base axis (full power background)
+        power_all=power_full_pos,           # full power
+        x_vals_display=x_vals_display,      # filtered spectrum axis (same grid usually)
+        power_display=power_display,        # filtered power (not strictly needed if you only show full + band)
+        band_mask=band_mask_for_plot,       # boolean mask on x_vals_all
+        xaxis_label=x_label,
         signal=signal, state=state,
         yaxis_type=yaxis_type,
         frac_info=frac_energy,
-        pdf_freqs=pdf_freqs, pdf_vals=pdf_vals, cdf_vals=cdf_vals, df_bin=df_bin,
-        band_mask_pdf=band_mask_pdf,
-        pdf_binned_freqs=pdf_binned_freqs, pdf_binned_vals=pdf_binned_vals,
-        pdf_yaxis_type=pdf_yaxis_type,
-        H_total=H_total, H_band=H_band, H_norm=H_norm, band_share=band_share
     )
 
 # ================= Factory App =================
@@ -427,22 +497,34 @@ def create_app(server, prefix="/app_fft_explorer/"):
                 accept='.csv', multiple=False
             ),
             html.Div(id='upload-status', style={"fontSize": "12px", "marginBottom": "10px", "whiteSpace": "pre-wrap"}),
-            dcc.Store(id="data-key"),      # 只存 key
+            dcc.Store(id="data-key"),
             dcc.Store(id="schema-store"),
             html.P("Workflow: (1) choose frequency band, (2) pad, (3) analyze.",
                    style={"fontSize": "13px", "marginBottom": "10px"}),
-            html.Label("Select State:"), dcc.Dropdown(id="state-dropdown", options=[], value=None, style={"marginBottom": "14px"}),
-            html.Label("Select Signal:"), dcc.Dropdown(id="signal-dropdown", options=[], value=None, style={"marginBottom": "14px"}),
+
+            html.Label("Select State:"),
+            dcc.Dropdown(id="state-dropdown", options=[], value=None, style={"marginBottom": "14px"}),
+
+            html.Label("Select Signal:"),
+            dcc.Dropdown(id="signal-dropdown", options=[], value=None, style={"marginBottom": "14px"}),
+
             html.Label("Frequency Band (Low - High):"),
-            dcc.RangeSlider(id="freq-range", min=0.001, max=0.5, step=0.001, value=[0.001, 0.5],
-                            marks={0.01: "0.01", 0.1: "0.1", 0.3: "0.3", 0.5: "0.5"},
-                            tooltip={"placement": "bottom"}),
+            dcc.RangeSlider(
+                id="freq-range", min=0.001, max=0.5, step=0.001, value=[0.001, 0.5],
+                marks={0.01: "0.01", 0.1: "0.1", 0.3: "0.3", 0.5: "0.5"},
+                tooltip={"placement": "bottom"}
+            ),
+
             html.Label("Pad Length (days):"),
             dcc.Input(id="pad-length", type="number", value=0, min=0, style={"marginBottom": "14px"}),
+
             html.Label("Pad Side:"),
-            dcc.Dropdown(id="pad-side",
-                         options=[{"label": "Both", "value": "both"}, {"label": "Left Only", "value": "left"}],
-                         value="both", style={"marginBottom": "14px"}),
+            dcc.Dropdown(
+                id="pad-side",
+                options=[{"label": "Both", "value": "both"}, {"label": "Left Only", "value": "left"}],
+                value="both", style={"marginBottom": "14px"}
+            ),
+
             html.Label("Y-axis scale (Amplitude):"),
             dcc.Dropdown(
                 id="yaxis-scale",
@@ -451,20 +533,18 @@ def create_app(server, prefix="/app_fft_explorer/"):
                 value="log",
                 style={"marginBottom": "14px"}
             ),
-            html.Label("PDF bins (Figure 3):"),
-            dcc.Slider(id="pdf-nbins", min=10, max=120, step=5, value=40,
-                       marks={10: "10", 40: "40", 80: "80", 120: "120"},
-                       tooltip={"placement": "bottom"}),
-            html.Label("PDF frequency binning:"),
-            dcc.Dropdown(id="pdf-logbins",
-                         options=[{"label": "Linear frequency bins", "value": "linear"},
-                                  {"label": "Log-frequency bins", "value": "log"}],
-                         value="linear", style={"marginBottom": "14px"}),
-            html.Label("PDF y-axis (Figure 3):"),
-            dcc.Dropdown(id="pdf-yaxis-scale",
-                         options=[{"label": "Linear", "value": "linear"},
-                                  {"label": "Log", "value": "log"}],
-                         value="log", style={"marginBottom": "14px"}),
+
+            # NEW: spectrum x-axis mode
+            html.Label("Spectrum X-axis:"),
+            dcc.Dropdown(
+                id="xaxis-mode",
+                options=[
+                    {"label": "Frequency (cycles/day)", "value": "frequency"},
+                    {"label": "Period (days)", "value": "period"},
+                ],
+                value="frequency",
+                style={"marginBottom": "14px"}
+            ),
         ]),
 
         html.Div(style={"width": "72%", "padding": "20px"}, children=[
@@ -539,12 +619,10 @@ def create_app(server, prefix="/app_fft_explorer/"):
         Input("pad-length", "value"),
         Input("pad-side", "value"),
         Input("yaxis-scale", "value"),
-        Input("pdf-nbins", "value"),
-        Input("pdf-logbins", "value"),
-        Input("pdf-yaxis-scale", "value"),
+        Input("xaxis-mode", "value"),
     )
     def update_fft_plot(data_key, schema, state, signal, freq_range, pad_len, pad_side,
-                        yaxis_scale, pdf_nbins, pdf_logbins, pdf_yaxis_scale):
+                        yaxis_scale, xaxis_mode):
         if not data_key or not schema or state is None or signal is None:
             return go.Figure().update_layout(title="No data available")
 
@@ -556,15 +634,14 @@ def create_app(server, prefix="/app_fft_explorer/"):
             return go.Figure().update_layout(title="Uploaded data missing required columns after normalization.")
 
         low_cutoff, high_cutoff = (freq_range or [0.001, 0.5])
+
         return generate_fft_figure(
             df, state, signal,
             pad_length=int(pad_len) if pad_len is not None else 0,
             low_cutoff=float(low_cutoff), high_cutoff=float(high_cutoff),
             filter_type="hard", pad_side=pad_side,
             yaxis_type=yaxis_scale or "linear",
-            pdf_nbins=int(pdf_nbins) if pdf_nbins is not None else 40,
-            pdf_logbins=(pdf_logbins == "log"),
-            pdf_yaxis_type=pdf_yaxis_scale or "linear"
+            xaxis_mode=xaxis_mode or "frequency",  # pass to generator
         )
 
     return dash_app
