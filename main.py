@@ -121,10 +121,9 @@ def create_server():
         </body>
         </html>
         """)
-        
-    @server.route("/healthz", methods=["GET"])
+    @server.get("/healthz")
     def healthz():
-        return ("ok", 200, {"Content-Type": "text/plain; charset=utf-8"})
+        return {"ok": True}, 200
 
     create_delay_app(server, prefix="/app_delay_filtering/")
     create_fft_app(server,   prefix="/app_fft_explorer/")
