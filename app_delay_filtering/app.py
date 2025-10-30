@@ -287,7 +287,18 @@ def create_app(server, prefix="/app_delay_filtering/"):
                 html.Div([dcc.Graph(id="psd-plot", style={"height": f"{MINI_H}px"})], className="mini-card"),
             ], className="area-minis minis-subgrid"),
 
-            # ===== Row 3 =====
+            html.Div(
+                [dcc.Graph(id="kernel-plot", style={"height": "420px"})],
+                className="card area-kernel"
+            ),
+
+            html.Div(
+                [],
+                className="card area-spacer",
+                style={"height": f"{MINI_H}px"}
+            ),
+
+            # ===== Row 3 (fixed bottom) =====
             html.Div([
                 html.H4("Control Zone", style={"margin": "0 0 8px 0"}),
 
@@ -368,7 +379,19 @@ def create_app(server, prefix="/app_delay_filtering/"):
 
             ], className="card area-controls"),
 
+            html.Div(
+                [dcc.Graph(id="kernel-plot", style={"height": "420px"})],
+                className="card area-kernel"
+            ),
+
+            html.Div(
+                [],
+                className="card area-spacer",
+                style={"height": f"{MINI_H}px"}
+            ),
+
         ], className="grid-root")
+
     ], style={"padding": "12px"})
 
     # ---- Minimal CSS (inline style tags or external asset) ----
@@ -376,25 +399,32 @@ def create_app(server, prefix="/app_delay_filtering/"):
         "</head>",
         """
         <style>
-        /* ===== Top-level grid ===== */
+        /* ===== Top-level grid: 2 columns (left content, right kernel), 3 rows (main, minis, controls) ===== */
         .grid-root {
           display: grid;
-          grid-template-columns: 1fr;
+          grid-template-columns: 4fr 1.5fr;
           grid-template-rows: auto auto auto;
           grid-template-areas:
-            "main"
-            "minis"
-            "controls";
+            "main kernel"
+            "minis spacer"
+            "controls controls";
           gap: 12px;
+
+          max-width: 1500px;
+          margin: 0 auto;
+          padding: 8px 12px;
           
-          max-width: 1500px;   
-          margin: 0 auto;      
-          padding: 8px 12px;  
+          align-items: start;
         }
         .area-main     { grid-area: main; }
         .area-minis    { grid-area: minis; }
         .area-controls { grid-area: controls; }
-        
+        .area-kernel { 
+          grid-area: kernel; 
+          align-self: start;   
+        }
+        .area-spacer   { grid-area: spacer;  align-self: start; height: auto; }
+
         /* minis */
         .minis-subgrid {
           display: grid;
@@ -403,17 +433,17 @@ def create_app(server, prefix="/app_delay_filtering/"):
         }
         .card { background:#fff; padding:10px; border-radius:10px; box-shadow:0 1px 3px rgba(0,0,0,0.08); }
         .mini-card { background:#fff; padding:6px; border-radius:10px; box-shadow:0 1px 3px rgba(0,0,0,0.08); }
-        
+
         /* ===== Control Zone ===== */
         .controls-outer-grid {
           display: grid;
-          grid-template-columns: 1fr;   /* single column now */
+          grid-template-columns: 1fr;   
           gap: 16px;
           align-items: start;
         }
         .controls-left-grid {
           display: grid;
-          grid-template-columns: 1fr 1fr;  /* keep your two control columns */
+          grid-template-columns: 1fr 1fr;  
           gap: 16px;
         }
         .controls-grid { display:grid; grid-template-columns: 1fr 1fr; gap:16px; }
@@ -456,6 +486,7 @@ def create_app(server, prefix="/app_delay_filtering/"):
         Output("psu-plot", "figure"),
         Output("delay-plot", "figure"),
         Output("psd-plot", "figure"),
+        Output("kernel-plot", "figure"),
         Input("update-btn", "n_clicks"),
         Input("geo-dropdown", "value"),
         State("delay-source", "value"),
@@ -480,7 +511,7 @@ def create_app(server, prefix="/app_delay_filtering/"):
         if delay_source == "synthetic":
             L = min(len(confirmed), (max_delay if max_delay else 60) + 1)
             delay_kernel = get_gamma_delay(L, mean, scale)
-            label = f"Gamma(mean={mean}, scale={scale})"
+            label = f"Gamma"
             mu = np.sum(np.arange(L) * delay_kernel)
             var = np.sum((np.arange(L) ** 2) * delay_kernel) - mu**2
             gamma_fit_txt = f" (μ≈{mu:.2f}, σ²≈{var:.2f})"
@@ -596,7 +627,7 @@ def create_app(server, prefix="/app_delay_filtering/"):
         fig_psu.update_layout(
             title="PSu(f) · Upstream Power Spectrum",
             xaxis_title="Frequency (cycles/day)", yaxis_title="Power",
-            height=MINI_H, margin=MINI_MARGIN, legend=LEGEND
+            title_font=dict(size=13), height=MINI_H, margin=MINI_MARGIN, legend=LEGEND
         )
 
         # ----- 3) Delay Spectrum (|G(f)|^2) with secondary axis for 100·(1 - |G(f)|^2) -----
@@ -627,7 +658,7 @@ def create_app(server, prefix="/app_delay_filtering/"):
 
         fig_delay.update_layout(
             title="Delay Spectrum · |G(f)|²  &  100·(1 − |G(f)|²)",
-            height=MINI_H, margin=MINI_MARGIN, legend=LEGEND
+            title_font=dict(size=13), height=MINI_H, margin=MINI_MARGIN, legend=LEGEND
         )
         fig_delay.update_xaxes(title_text="Frequency (cycles/day)")
         fig_delay.update_yaxes(title_text="Power |G(f)|²", range=[0, 1], secondary_y=False)
@@ -659,11 +690,33 @@ def create_app(server, prefix="/app_delay_filtering/"):
         fig_psd.update_layout(
             title="PSd(f) · Downstream Power Spectrum",
             xaxis_title="Frequency (cycles/day)", yaxis_title="Power",
-            height=MINI_H, margin=MINI_MARGIN, legend=LEGEND
+            title_font=dict(size=13), height=MINI_H, margin=MINI_MARGIN, legend=LEGEND
+        )
+
+        # ----- Kernel (Delay distribution) figure, right column -----
+        x_days = np.arange(len(delay_kernel))
+        fig_kernel = go.Figure()
+        fig_kernel.add_trace(go.Scatter(
+            x=x_days,
+            y=delay_kernel,
+            mode="lines+markers",  # or "lines"
+            name="P(delay = d)",
+            line=dict(width=2),
+            marker=dict(size=4)
+        ))
+
+        fig_kernel.update_layout(
+            title=f"Delay Distribution (days) — {label}{gamma_fit_txt}",
+            xaxis_title="Delay d (days)",
+            yaxis_title="Probability",
+            yaxis=dict(range=[0, max(0.001, float(np.max(delay_kernel)) * 1.05)]),
+            height=420,
+            margin=dict(t=60, r=20, l=60, b=40),
+            showlegend=False
         )
 
 
         # ----- Return all five figures -----
-        return fig_main, fig_psu, fig_delay, fig_psd
+        return fig_main, fig_psu, fig_delay, fig_psd, fig_kernel
 
     return dash_app
