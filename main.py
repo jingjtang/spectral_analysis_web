@@ -122,6 +122,11 @@ def create_server():
         </html>
         """)
 
+    def healthz():
+        # keep-alive
+        cache.get("noop")
+        return {"ok": True}, 200
+
     create_delay_app(server, prefix="/app_delay_filtering/")
     create_fft_app(server,   prefix="/app_fft_explorer/")
     # create_multi_app(server, prefix="/app_multiple_delay_filtering/")
