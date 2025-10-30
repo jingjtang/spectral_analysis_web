@@ -7,7 +7,7 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 from scipy.fft import rfft, irfft, rfftfreq
-from dash import Dash, dcc, html, Input, Output, State
+from dash import Dash, dcc, html, Input, Output, State, ctx
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
@@ -99,6 +99,103 @@ def detect_schema(df: pd.DataFrame):
         raise ValueError("Could not detect a usable schema.")
     simple_df = _optimize_df(simple_df)
     return {"mode": "simple", "states": ["uploaded"], "signals": ["value"], "df": simple_df}
+
+# ============== Simulated Data Factory (time series) ==============
+def _rng(seed: Optional[int]):
+    # Helper to create a numpy Generator with an optional seed
+    return np.random.default_rng(None if seed in (None, "", "None") else int(seed))
+
+def synth_white_gaussian(n: int, mean: float, std: float, seed: Optional[int]):
+    """y[t] = mean + N(0, std^2)"""
+    r = _rng(seed)
+    y = mean + r.normal(0.0, std, size=n)
+    return y
+
+def synth_ar1_gaussian(n: int, phi: float, std: float, mean: float, seed: Optional[int]):
+    """AR(1): y[t] = mean + phi*(y[t-1]-mean) + eps, eps~N(0, std^2)"""
+    r = _rng(seed)
+    y = np.zeros(n, dtype=float)
+    y[0] = mean + r.normal(0.0, std)
+    for t in range(1, n):
+        y[t] = mean + phi * (y[t-1] - mean) + r.normal(0.0, std)
+    return y
+
+def synth_poisson(n: int, lam: float, seed: Optional[int]):
+    """y[t] ~ Poisson(lam), returned as float"""
+    r = _rng(seed)
+    y = r.poisson(lam, size=n).astype(float)
+    return y
+
+def synth_piecewise_constant(n: int, n_segments: int, low: float, high: float,
+                             noise_std: float, seed: Optional[int]):
+    """Piecewise-constant mean with Gaussian noise."""
+    r = _rng(seed)
+    # Choose breakpoints and levels
+    n_segments = max(1, int(n_segments))
+    if n_segments > n:
+        n_segments = n
+    # Random break positions (sorted, unique), ensure start and end included
+    if n_segments == 1:
+        breaks = [0, n]
+    else:
+        cut_points = sorted(r.choice(np.arange(1, n), size=n_segments - 1, replace=False).tolist())
+        breaks = [0] + cut_points + [n]
+    levels = r.uniform(low, high, size=len(breaks) - 1)
+    y = np.empty(n, dtype=float)
+    for i in range(len(levels)):
+        y[breaks[i]:breaks[i+1]] = levels[i]
+    # Add small Gaussian noise
+    if noise_std > 0:
+        y = y + r.normal(0.0, noise_std, size=n)
+    return y
+
+def synth_spikes_on_constant(n: int, baseline: float, n_spikes: int,
+                             amp_low: float, amp_high: float, width_min: int, width_max: int,
+                             seed: Optional[int]):
+    """Constant baseline plus several positive spikes (box/carrier) with random positions and widths."""
+    r = _rng(seed)
+    y = np.full(n, float(baseline))
+    n_spikes = max(0, int(n_spikes))
+    for _ in range(n_spikes):
+        w = int(r.integers(width_min, width_max + 1))
+        pos = int(r.integers(0, max(1, n - w)))
+        amp = float(r.uniform(amp_low, amp_high))
+        y[pos:pos + w] += amp
+    return y
+
+def make_simulated_df(kind: str, length: int, seed: Optional[int], params: dict) -> pd.DataFrame:
+    """
+    Build a DataFrame with columns [time_value, geo_value, value] for simulated data.
+    geo_value is set to 'simulated'. time_value is daily from 2000-01-01.
+    """
+    length = max(5, int(length))
+    base = pd.Timestamp("2000-01-01")
+    if kind == "white":
+        y = synth_white_gaussian(length, params.get("mean", 0.0), params.get("std", 1.0), seed)
+    elif kind == "ar1":
+        y = synth_ar1_gaussian(length, params.get("phi", 0.8), params.get("std", 1.0), params.get("mean", 0.0), seed)
+    elif kind == "poisson":
+        y = synth_poisson(length, params.get("lam", 10.0), seed)
+    elif kind == "piecewise":
+        y = synth_piecewise_constant(length, params.get("n_segments", 4),
+                                     params.get("low", 0.0), params.get("high", 10.0),
+                                     params.get("noise_std", 0.5), seed)
+    elif kind == "spikes":
+        y = synth_spikes_on_constant(length, params.get("baseline", 0.0),
+                                     params.get("n_spikes", 5),
+                                     params.get("amp_low", 5.0), params.get("amp_high", 20.0),
+                                     params.get("width_min", 1), params.get("width_max", 5),
+                                     seed)
+    else:
+        raise ValueError(f"Unknown simulated kind: {kind}")
+
+    df = pd.DataFrame({
+        "time_value": base + pd.to_timedelta(np.arange(length), unit="D"),
+        "geo_value": "simulated",
+        "value": y.astype(float)
+    })
+    df = _optimize_df(df)
+    return df
 
 # ============== FFT Utils (rFFT) ==============
 def extract_signal(df, state, signal, date_cutoff="2020-12-31"):
@@ -245,6 +342,42 @@ def create_fft_plot(
       - Global legend is disabled; we draw internal legends via shapes + annotations.
       - All comments are in English as requested.
     """
+
+    # ===== Internal top-right legends (unchanged) =====
+    def add_internal_legend_topright(fig, xdomain, ydomain, items,
+                                     box_pad=0.010, row_gap=0.075,
+                                     swatch_w=0.020, swatch_h=0.040,
+                                     font_size=12, with_bg=True):
+        # Draw compact legend inside the plot area
+        x1 = xdomain[1] - box_pad
+        y1 = ydomain[1] - box_pad
+        for i, (label, color) in enumerate(items):
+            y_top = y1 - i * row_gap
+            fig.add_shape(
+                type="rect",
+                xref="paper", yref="paper",
+                x0=x1 - swatch_w, x1=x1,
+                y0=y_top - swatch_h, y1=y_top,
+                line=dict(width=0.5, color="rgba(0,0,0,0.25)"),
+                fillcolor=color,
+                layer="above",
+            )
+            fig.add_annotation(
+                xref="paper", yref="paper",
+                x=(x1 - swatch_w - 0.006),
+                y=(y_top - swatch_h / 2.0),
+                text=label,
+                showarrow=False,
+                xanchor="right",
+                yanchor="middle",
+                font=dict(size=font_size),
+                bgcolor=("rgba(255,255,255,0.70)" if with_bg else None),
+                bordercolor=("rgba(0,0,0,0.25)" if with_bg else None),
+                borderwidth=(0.5 if with_bg else 0),
+                align="left",
+                opacity=0.98,
+            )
+
     # --- Subplot titles ---
     title_row1 = "Time-Domain Signal (Original vs Reconstructed)"
     axis_hint = "Frequency axis" if "Frequency" in xaxis_label else "Period axis"
@@ -336,41 +469,6 @@ def create_fft_plot(
             ann.update(font=dict(size=16), xanchor="left", x=0.01)
         if ann.text == title_row2:
             ann.update(font=dict(size=16), xanchor="left", x=0.01)
-
-            # ===== Internal top-right legends (unchanged) =====
-            def add_internal_legend_topright(fig, xdomain, ydomain, items,
-                                             box_pad=0.010, row_gap=0.075,
-                                             swatch_w=0.020, swatch_h=0.040,
-                                             font_size=12, with_bg=True):
-                # Draw compact legend inside the plot area
-                x1 = xdomain[1] - box_pad
-                y1 = ydomain[1] - box_pad
-                for i, (label, color) in enumerate(items):
-                    y_top = y1 - i * row_gap
-                    fig.add_shape(
-                        type="rect",
-                        xref="paper", yref="paper",
-                        x0=x1 - swatch_w, x1=x1,
-                        y0=y_top - swatch_h, y1=y_top,
-                        line=dict(width=0.5, color="rgba(0,0,0,0.25)"),
-                        fillcolor=color,
-                        layer="above",
-                    )
-                    fig.add_annotation(
-                        xref="paper", yref="paper",
-                        x=(x1 - swatch_w - 0.006),
-                        y=(y_top - swatch_h / 2.0),
-                        text=label,
-                        showarrow=False,
-                        xanchor="right",
-                        yanchor="middle",
-                        font=dict(size=font_size),
-                        bgcolor=("rgba(255,255,255,0.70)" if with_bg else None),
-                        bordercolor=("rgba(0,0,0,0.25)" if with_bg else None),
-                        borderwidth=(0.5 if with_bg else 0),
-                        align="left",
-                        opacity=0.98,
-                    )
 
     # Domains for legend placement
     x1d = tuple(fig.layout.xaxis.domain)
@@ -486,6 +584,14 @@ def create_app(server, prefix="/app_fft_explorer/"):
     if not prefix.endswith("/"):
         prefix = prefix + "/"
 
+    PANEL_STYLE = {
+        "marginBottom": "18px",
+        "padding": "12px",
+        "border": "1px solid #ddd",
+        "borderRadius": "6px",
+        "background": "#fafafa",
+    }
+
     dash_app = Dash(
         __name__,
         server=server,
@@ -496,109 +602,516 @@ def create_app(server, prefix="/app_fft_explorer/"):
     )
 
     # -------- Layout --------
-    dash_app.layout = html.Div(style={"display": "flex"}, children=[
-        html.Div(style={"width": "28%", "padding": "20px"}, children=[
-            html.H3("Controls"),
-            dcc.Upload(
-                id='upload-data',
-                children=html.Div(['Drag and Drop or ', html.A('Select CSV File')]),
-                style={'width': '100%', 'height': '60px', 'lineHeight': '60px',
-                       'borderWidth': '1px', 'borderStyle': 'dashed',
-                       'borderRadius': '5px', 'textAlign': 'center', 'marginBottom': '15px'},
-                accept='.csv', multiple=False
-            ),
-            html.Div(id='upload-status', style={"fontSize": "12px", "marginBottom": "10px", "whiteSpace": "pre-wrap"}),
-            dcc.Store(id="data-key"),
-            dcc.Store(id="schema-store"),
-            html.P("Workflow: (1) choose frequency band, (2) pad, (3) analyze.",
-                   style={"fontSize": "13px", "marginBottom": "10px"}),
+    dash_app.layout = html.Div(
+        style={"display": "flex", "gap": "16px"},
+        children=[
+            # ================= Left column (28%): Controls + Simulated stacked =================
+            html.Div(
+                style={
+                    "width": "28%",
+                    "padding": "20px",
+                    "display": "flex",
+                    "flexDirection": "column",
+                    "gap": "16px",
+                },
+                children=[
+                    # ----- Controls panel -----
+                    html.Div(
+                        style=PANEL_STYLE,
+                        children=[
+                            html.H3("Controls", style={"marginTop": 0}),
 
-            html.Label("Select State:"),
-            dcc.Dropdown(id="state-dropdown", options=[], value=None, style={"marginBottom": "14px"}),
+                            dcc.Upload(
+                                id="upload-data",
+                                children=html.Div(
+                                    ["Drag and Drop or ", html.A("Select CSV File")]
+                                ),
+                                style={
+                                    "width": "100%",
+                                    "height": "60px",
+                                    "lineHeight": "60px",
+                                    "borderWidth": "1px",
+                                    "borderStyle": "dashed",
+                                    "borderRadius": "5px",
+                                    "textAlign": "center",
+                                    "marginBottom": "15px",
+                                },
+                                accept=".csv",
+                                multiple=False,
+                            ),
+                            html.Div(
+                                id="upload-status",
+                                style={
+                                    "fontSize": "12px",
+                                    "marginBottom": "10px",
+                                    "whiteSpace": "pre-wrap",
+                                },
+                            ),
 
-            html.Label("Select Signal:"),
-            dcc.Dropdown(id="signal-dropdown", options=[], value=None, style={"marginBottom": "14px"}),
+                            # Hidden stores
+                            dcc.Store(id="data-key"),
+                            dcc.Store(id="schema-store"),
 
-            html.Label("Frequency Band (Low - High):"),
-            dcc.RangeSlider(
-                id="freq-range", min=0.001, max=0.5, step=0.001, value=[0.001, 0.5],
-                marks={0.01: "0.01", 0.1: "0.1", 0.3: "0.3", 0.5: "0.5"},
-                tooltip={"placement": "bottom"}
-            ),
+                            html.P(
+                                "Workflow: (1) choose frequency band, (2) pad, (3) analyze.",
+                                style={
+                                    "fontSize": "13px",
+                                    "marginBottom": "10px",
+                                },
+                            ),
 
-            html.Label("Pad Length (days):"),
-            dcc.Input(id="pad-length", type="number", value=0, min=0, style={"marginBottom": "14px"}),
+                            html.Label("Select State:"),
+                            dcc.Dropdown(
+                                id="state-dropdown",
+                                options=[],
+                                value=None,
+                                style={"marginBottom": "14px"},
+                            ),
 
-            html.Label("Pad Side:"),
-            dcc.Dropdown(
-                id="pad-side",
-                options=[{"label": "Both", "value": "both"}, {"label": "Left Only", "value": "left"}],
-                value="both", style={"marginBottom": "14px"}
-            ),
+                            html.Label("Select Signal:"),
+                            dcc.Dropdown(
+                                id="signal-dropdown",
+                                options=[],
+                                value=None,
+                                style={"marginBottom": "14px"},
+                            ),
 
-            html.Label("Y-axis scale (Amplitude):"),
-            dcc.Dropdown(
-                id="yaxis-scale",
-                options=[{"label": "Linear", "value": "linear"},
-                         {"label": "Log", "value": "log"}],
-                value="log",
-                style={"marginBottom": "14px"}
-            ),
+                            html.Label("Frequency Band (Low - High):"),
+                            dcc.RangeSlider(
+                                id="freq-range",
+                                min=0.001,
+                                max=0.5,
+                                step=0.001,
+                                value=[0.001, 0.5],
+                                marks={0.01: "0.01", 0.1: "0.1", 0.3: "0.3", 0.5: "0.5"},
+                                tooltip={"placement": "bottom"},
+                            ),
 
-            # NEW: spectrum x-axis mode
-            html.Label("Spectrum X-axis:"),
-            dcc.Dropdown(
-                id="xaxis-mode",
-                options=[
-                    {"label": "Frequency (cycles/day)", "value": "frequency"},
-                    {"label": "Period (days)", "value": "period"},
+                            html.Label("Pad Length (days):"),
+                            dcc.Input(
+                                id="pad-length",
+                                type="number",
+                                value=0,
+                                min=0,
+                                style={"marginBottom": "14px"},
+                            ),
+
+                            html.Label("Pad Side:"),
+                            dcc.Dropdown(
+                                id="pad-side",
+                                options=[
+                                    {"label": "Both", "value": "both"},
+                                    {"label": "Left Only", "value": "left"},
+                                ],
+                                value="both",
+                                style={"marginBottom": "14px"},
+                            ),
+
+                            html.Label("Y-axis scale (Amplitude):"),
+                            dcc.Dropdown(
+                                id="yaxis-scale",
+                                options=[
+                                    {"label": "Linear", "value": "linear"},
+                                    {"label": "Log", "value": "log"},
+                                ],
+                                value="log",
+                                style={"marginBottom": "14px"},
+                            ),
+
+                            html.Label("Spectrum X-axis:"),
+                            dcc.Dropdown(
+                                id="xaxis-mode",
+                                options=[
+                                    {"label": "Frequency (cycles/day)", "value": "frequency"},
+                                    {"label": "Period (days)", "value": "period"},
+                                ],
+                                value="frequency",
+                                style={"marginBottom": "14px"},
+                            ),
+                        ],
+                    ),
+
+                    # ----- Simulated data (optional) panel -----
+                    html.Div(
+                        style=PANEL_STYLE,
+                        children=[
+                            html.H4(
+                                "Simulated data (optional)",
+                                style={"marginTop": 0, "marginBottom": "8px"},
+                            ),
+
+                            html.Label("Type:"),
+                            dcc.Dropdown(
+                                id="synth-kind",
+                                options=[
+                                    {"label": "White Gaussian noise", "value": "white"},
+                                    {"label": "AR(1) Gaussian noise", "value": "ar1"},
+                                    {"label": "Poisson noise", "value": "poisson"},
+                                    {"label": "Piecewise-constant + Gaussian noise", "value": "piecewise"},
+                                    {"label": "Constant + spikes", "value": "spikes"},
+                                ],
+                                value="white",
+                                style={"marginBottom": "10px"},
+                            ),
+
+                            html.Label("Length (days):"),
+                            dcc.Input(
+                                id="synth-length",
+                                type="number",
+                                value=730,
+                                min=20,
+                                step=1,
+                                style={"marginBottom": "10px", "width": "100%"},
+                            ),
+
+                            html.Label("Random seed (optional):"),
+                            dcc.Input(
+                                id="synth-seed",
+                                type="text",
+                                value="",
+                                style={"marginBottom": "10px", "width": "100%"},
+                            ),
+
+                            html.Div(
+                                id="synth-param-block",
+                                children=[
+                                    # White Gaussian
+                                    html.Div(
+                                        id="params-white",
+                                        children=[
+                                            html.Label("Mean:"),
+                                            dcc.Input(
+                                                id="white-mean",
+                                                type="number",
+                                                value=0.0,
+                                                step=0.1,
+                                                style={"marginBottom": "6px", "width": "100%"},
+                                            ),
+                                            html.Label("Std:"),
+                                            dcc.Input(
+                                                id="white-std",
+                                                type="number",
+                                                value=1.0,
+                                                step=0.1,
+                                                style={"marginBottom": "10px", "width": "100%"},
+                                            ),
+                                        ],
+                                    ),
+                                    # AR(1)
+                                    html.Div(
+                                        id="params-ar1",
+                                        style={"display": "none"},
+                                        children=[
+                                            html.Label("AR(1) phi:"),
+                                            dcc.Input(
+                                                id="ar1-phi",
+                                                type="number",
+                                                value=0.8,
+                                                step=0.05,
+                                                style={"marginBottom": "6px", "width": "100%"},
+                                            ),
+                                            html.Label("Innovation std:"),
+                                            dcc.Input(
+                                                id="ar1-std",
+                                                type="number",
+                                                value=1.0,
+                                                step=0.1,
+                                                style={"marginBottom": "6px", "width": "100%"},
+                                            ),
+                                            html.Label("Mean:"),
+                                            dcc.Input(
+                                                id="ar1-mean",
+                                                type="number",
+                                                value=0.0,
+                                                step=0.1,
+                                                style={"marginBottom": "10px", "width": "100%"},
+                                            ),
+                                        ],
+                                    ),
+                                    # Poisson
+                                    html.Div(
+                                        id="params-poisson",
+                                        style={"display": "none"},
+                                        children=[
+                                            html.Label("Lambda (rate):"),
+                                            dcc.Input(
+                                                id="pois-lam",
+                                                type="number",
+                                                value=10.0,
+                                                step=0.5,
+                                                style={"marginBottom": "10px", "width": "100%"},
+                                            ),
+                                        ],
+                                    ),
+                                    # Piecewise
+                                    html.Div(
+                                        id="params-piecewise",
+                                        style={"display": "none"},
+                                        children=[
+                                            html.Label("Segments:"),
+                                            dcc.Input(
+                                                id="pw-seg",
+                                                type="number",
+                                                value=4,
+                                                step=1,
+                                                style={"marginBottom": "6px", "width": "100%"},
+                                            ),
+                                            html.Label("Level range [low, high]:"),
+                                            html.Div(
+                                                style={"display": "flex", "gap": "8px", "marginBottom": "6px"},
+                                                children=[
+                                                    dcc.Input(
+                                                        id="pw-low",
+                                                        type="number",
+                                                        value=0.0,
+                                                        step=0.5,
+                                                        style={"width": "50%"},
+                                                    ),
+                                                    dcc.Input(
+                                                        id="pw-high",
+                                                        type="number",
+                                                        value=10.0,
+                                                        step=0.5,
+                                                        style={"width": "50%"},
+                                                    ),
+                                                ],
+                                            ),
+                                            html.Label("Noise std:"),
+                                            dcc.Input(
+                                                id="pw-noise",
+                                                type="number",
+                                                value=0.5,
+                                                step=0.1,
+                                                style={"marginBottom": "10px", "width": "100%"},
+                                            ),
+                                        ],
+                                    ),
+                                    # Spikes
+                                    html.Div(
+                                        id="params-spikes",
+                                        style={"display": "none"},
+                                        children=[
+                                            html.Label("Baseline:"),
+                                            dcc.Input(
+                                                id="spk-base",
+                                                type="number",
+                                                value=0.0,
+                                                step=0.5,
+                                                style={"marginBottom": "6px", "width": "100%"},
+                                            ),
+                                            html.Label("Number of spikes:"),
+                                            dcc.Input(
+                                                id="spk-count",
+                                                type="number",
+                                                value=5,
+                                                step=1,
+                                                style={"marginBottom": "6px", "width": "100%"},
+                                            ),
+                                            html.Label("Spike amplitude range [low, high]:"),
+                                            html.Div(
+                                                style={"display": "flex", "gap": "8px", "marginBottom": "6px"},
+                                                children=[
+                                                    dcc.Input(
+                                                        id="spk-alo",
+                                                        type="number",
+                                                        value=5.0,
+                                                        step=0.5,
+                                                        style={"width": "50%"},
+                                                    ),
+                                                    dcc.Input(
+                                                        id="spk-ahi",
+                                                        type="number",
+                                                        value=20.0,
+                                                        step=0.5,
+                                                        style={"width": "50%"},
+                                                    ),
+                                                ],
+                                            ),
+                                            html.Label("Spike width [min, max] (days):"),
+                                            html.Div(
+                                                style={"display": "flex", "gap": "8px", "marginBottom": "10px"},
+                                                children=[
+                                                    dcc.Input(
+                                                        id="spk-wmin",
+                                                        type="number",
+                                                        value=1,
+                                                        step=1,
+                                                        style={"width": "50%"},
+                                                    ),
+                                                    dcc.Input(
+                                                        id="spk-wmax",
+                                                        type="number",
+                                                        value=5,
+                                                        step=1,
+                                                        style={"width": "50%"},
+                                                    ),
+                                                ],
+                                            ),
+                                        ],
+                                    ),
+                                ],
+                            ),
+
+                            html.Button(
+                                "Generate simulated dataset",
+                                id="synth-generate",
+                                n_clicks=0,
+                                style={"width": "100%", "marginTop": "6px"},
+                            ),
+                            html.Div(
+                                id="synth-status",
+                                style={
+                                    "fontSize": "12px",
+                                    "marginTop": "6px",
+                                    "whiteSpace": "pre-wrap",
+                                    "color": "#444",
+                                },
+                            ),
+                        ],
+                    ),
                 ],
-                value="frequency",
-                style={"marginBottom": "14px"}
             ),
-        ]),
 
-        html.Div(style={"width": "72%", "padding": "12px"}, children=[
-            dcc.Graph(id="fft-figure", style={"height": "720px"})
-        ])
-    ])
+            # ================= Right content (figure) =================
+            html.Div(
+                style={"width": "72%", "padding": "12px"},
+                children=[dcc.Graph(id="fft-figure", style={"height": "720px"})],
+            ),
+        ],
+    )
 
     # -------- Callbacks --------
+    @dash_app.callback(
+        Output("params-white", "style"),
+        Output("params-ar1", "style"),
+        Output("params-poisson", "style"),
+        Output("params-piecewise", "style"),
+        Output("params-spikes", "style"),
+        Input("synth-kind", "value"),
+    )
+    def _toggle_synth_params(kind):
+        # Show only the chosen block; others hidden
+        show = {"display": "block"}
+        hide = {"display": "none"}
+        return (
+            show if kind == "white" else hide,
+            show if kind == "ar1" else hide,
+            show if kind == "poisson" else hide,
+            show if kind == "piecewise" else hide,
+            show if kind == "spikes" else hide,
+        )
+
     @dash_app.callback(
         Output("data-key", "data"),
         Output("schema-store", "data"),
         Output("upload-status", "children"),
+        Output("synth-status", "children"),
         Input("upload-data", "contents"),
         State("upload-data", "filename"),
+        Input("synth-generate", "n_clicks"),
+        State("synth-kind", "value"),
+        State("synth-length", "value"),
+        State("synth-seed", "value"),
+        # White
+        State("white-mean", "value"), State("white-std", "value"),
+        # AR1
+        State("ar1-phi", "value"), State("ar1-std", "value"), State("ar1-mean", "value"),
+        # Poisson
+        State("pois-lam", "value"),
+        # Piecewise
+        State("pw-seg", "value"), State("pw-low", "value"), State("pw-high", "value"), State("pw-noise", "value"),
+        # Spikes
+        State("spk-base", "value"), State("spk-count", "value"),
+        State("spk-alo", "value"), State("spk-ahi", "value"),
+        State("spk-wmin", "value"), State("spk-wmax", "value"),
         prevent_initial_call=False
     )
-    def init_or_upload(contents, filename):
+    def init_or_upload(contents, filename,
+                       synth_clicks, kind, length, seed,
+                       w_mean, w_std,
+                       a_phi, a_std, a_mean,
+                       p_lam,
+                       pw_seg, pw_low, pw_high, pw_noise,
+                       sp_base, sp_count, sp_alo, sp_ahi, sp_wmin, sp_wmax):
+        """
+        Unified initializer:
+          - If 'Generate simuated dataset' was clicked, build simulated df and set it as current dataset.
+          - Else if a CSV was uploaded, use the uploaded.
+          - Else load the default CSV.
+        """
         try:
+            trig = ctx.triggered_id
+
+            # ----- Case A: Simulated generator triggered -----
+            if trig == "synth-generate" and (synth_clicks or 0) > 0:
+                params = {}
+                if kind == "white":
+                    params = {"mean": float(w_mean or 0.0), "std": float(w_std or 1.0)}
+                elif kind == "ar1":
+                    params = {"phi": float(a_phi or 0.8), "std": float(a_std or 1.0), "mean": float(a_mean or 0.0)}
+                elif kind == "poisson":
+                    params = {"lam": float(p_lam or 10.0)}
+                elif kind == "piecewise":
+                    params = {
+                        "n_segments": int(pw_seg or 4),
+                        "low": float(pw_low or 0.0),
+                        "high": float(pw_high or 10.0),
+                        "noise_std": float(pw_noise or 0.5),
+                    }
+                elif kind == "spikes":
+                    params = {
+                        "baseline": float(sp_base or 0.0),
+                        "n_spikes": int(sp_count or 5),
+                        "amp_low": float(sp_alo or 5.0),
+                        "amp_high": float(sp_ahi or 20.0),
+                        "width_min": int(sp_wmin or 1),
+                        "width_max": int(sp_wmax or 5),
+                    }
+
+                df_syn = make_simulated_df(kind, int(length or 365), seed, params)
+                schema = detect_schema(df_syn)
+                key = cache_put_df(schema["df"], tag=f"simulated:{kind}")
+                status_upload = "Using simulated dataset.\n"
+                status_synth = f"Generated simulated: kind={kind}, length={len(df_syn)}, seed={seed}\n"
+                return (
+                    key,
+                    {"mode": schema["mode"], "states": schema["states"], "signals": schema["signals"]},
+                    status_upload,
+                    status_synth
+                )
+
+            # ----- Case B: CSV upload triggered -----
             if contents is not None and filename:
                 df_up = parse_uploaded_contents(contents, filename)
                 schema = detect_schema(df_up)
                 key = cache_put_df(schema["df"], tag=filename)
-                status = f"Loaded file: {filename}\n"
+                status_upload = f"Loaded file: {filename}\n"
                 return (
                     key,
                     {"mode": schema["mode"], "states": schema["states"], "signals": schema["signals"]},
-                    status
+                    status_upload,
+                    ""
                 )
-            # default boot
+
+            # ----- Case C: Fallback to default dataset -----
             default_df = load_default_df()
             default_schema = detect_schema(default_df)
             key = cache_put_df(default_schema["df"], tag="default")
-            status = f"Using default dataset at {DEFAULT_PATH}\nMode: {default_schema['mode']}\nRows: {len(default_schema['df'])}"
+            status_upload = f"Using default dataset at {DEFAULT_PATH}\nMode: {default_schema['mode']}\nRows: {len(default_schema['df'])}"
             return (
                 key,
-                {"mode": default_schema["mode"], "states": default_schema["states"], "signals": default_schema["signals"]},
-                status
+                {"mode": default_schema["mode"], "states": default_schema["states"],
+                 "signals": default_schema["signals"]},
+                status_upload,
+                ""
             )
+
         except Exception as e:
-            # fail-safe: tiny empty frame to avoid crashing worker
-            tiny = pd.DataFrame({"time_value": pd.to_datetime([]), "geo_value": pd.Series([], dtype="category"), "value": []})
+            # Fail-safe empty frame
+            tiny = pd.DataFrame(
+                {"time_value": pd.to_datetime([]), "geo_value": pd.Series([], dtype="category"), "value": []})
             key = cache_put_df(tiny, tag="empty")
-            return key, {"mode": "simple", "states": ["uploaded"], "signals": ["value"]}, f"Error: {e}"
+            return key, {"mode": "simple", "states": ["uploaded"], "signals": ["value"]}, f"Error: {e}", ""
 
     @dash_app.callback(
         Output("state-dropdown", "options"),
