@@ -245,14 +245,19 @@ def create_fft_plot(
       - Global legend is disabled; we draw internal legends via shapes + annotations.
       - All comments are in English as requested.
     """
-    subtitle_power = "Power Spectrum (|FFT|², full)"
+    # --- Subplot titles ---
+    title_row1 = "Time-Domain Signal (Original vs Reconstructed)"
+    axis_hint = "Frequency axis" if "Frequency" in xaxis_label else "Period axis"
     if frac_info is not None:
-        subtitle_power += f"<br> — Selected Band Energy = {frac_info:.1%}"
+        title_row2 = f"Power Spectrum (|FFT|², {axis_hint}) — Selected Band Energy = {frac_info:.1%}"
+    else:
+        title_row2 = f"Power Spectrum (|FFT|², {axis_hint})"
 
     fig = make_subplots(
         rows=2, cols=1,
         specs=[[{}], [{}]],
-        vertical_spacing=0.12
+        vertical_spacing=0.12,
+        subplot_titles=(title_row1, title_row2)
     )
 
     # ===== Row 1: Time-domain traces (disable global legend) =====
@@ -265,37 +270,51 @@ def create_fft_plot(
 
     fig.add_trace(go.Scatter(
         x=full_time, y=y_plot_recon,
-        name="Reconstructed",
+        name="Reconstructed with selected frequencies",
         line=dict(color="blue"),
         showlegend=False
     ), row=1, col=1)
 
     # ===== Row 2: Power spectrum (two-layer bars) =====
     # Sort by x for proper bar ordering
-    order_all = np.argsort(x_vals_all)
-    xa = np.asarray(x_vals_all)[order_all]
-    Pa = np.asarray(power_all)[order_all]
+    xa = np.asarray(x_vals_all, dtype=float)
+    Pa = np.asarray(power_all, dtype=float)
+    order_all = np.argsort(xa)
+    xa = xa[order_all]
+    Pa = Pa[order_all]
 
     # Light green: full spectrum
-    widths = (np.full_like(xa, float(np.mean(np.diff(xa)))) if len(xa) > 1 else np.array([0.0]))
+    if len(xa) > 1:
+        mids = 0.5 * (xa[1:] + xa[:-1])
+        edges = np.empty(len(xa) + 1, dtype=float)
+        edges[1:-1] = mids
+        edges[0] = xa[0] - (mids[0] - xa[0])
+        edges[-1] = xa[-1] + (xa[-1] - mids[-1])
+        eps = 1e-9
+        edges = np.maximum.accumulate(edges)
+        widths = np.clip(edges[1:] - edges[:-1], eps, None)
+    else:
+        widths = np.array([1.0])
+
+    # Light green: full spectrum
     fig.add_trace(go.Bar(
         x=xa, y=Pa, width=widths,
-        marker=dict(color='rgba(0,128,0,0.35)'),
+        marker=dict(color='rgba(0,128,0,0.35)', line=dict(width=0)),
         name="Power (full, |FFT|²)",
         showlegend=False
     ), row=2, col=1)
 
     # Dark green overlay: selected band
-    band_overlay = None
     if band_mask is not None and np.any(band_mask):
         mask_sorted = np.asarray(band_mask)[order_all]
         fig.add_trace(go.Bar(
-            x=xa[mask_sorted], y=Pa[mask_sorted],
-            width=widths[mask_sorted],
-            marker=dict(color='rgba(0,128,0,0.95)'),
+            x=xa[mask_sorted], y=Pa[mask_sorted], width=widths[mask_sorted],
+            marker=dict(color='rgba(0,128,0,0.95)', line=dict(width=0)),
             name="Selected band",
             showlegend=False
         ), row=2, col=1)
+
+    fig.update_layout(barmode="overlay", bargap=0.0, bargroupgap=0.0)
 
     # ===== Axes and layout =====
     fig.update_xaxes(title_text="Time", row=1, col=1)
@@ -304,79 +323,71 @@ def create_fft_plot(
 
     fig.update_layout(
         height=750,
-        title=f"{signal} in {state} — FFT Analysis",
-        margin=dict(t=80, r=20, l=60, b=60),
+        title=f"{signal}, {state.upper()}",
+        title_font=dict(size=20),
+        margin=dict(t=110, r=20, l=60, b=60),  # more top room so titles don’t get clipped
         showlegend=False
     )
 
-    # ===== Internal top-right legends for each subplot (C1: semi-transparent white bg; M font) =====
-    def add_internal_legend_topright(fig, xdomain, ydomain, items,
-                                     box_pad=0.010, row_gap=0.075,
-                                     swatch_w=0.020, swatch_h=0.040,
-                                     font_size=12, with_bg=True):
-        """
-        Draw a compact "journal-style" legend inside top-right of a given subplot domain.
-        """
-        x1 = xdomain[1] - box_pad
-        y1 = ydomain[1] - box_pad
-        for i, (label, color) in enumerate(items):
-            y_top = y1 - i * row_gap
-            # color swatch
-            fig.add_shape(
-                type="rect",
-                xref="paper", yref="paper",
-                x0=x1 - swatch_w, x1=x1,
-                y0=y_top - swatch_h, y1=y_top,
-                line=dict(width=0.5, color="rgba(0,0,0,0.25)"),
-                fillcolor=color,
-                layer="above",
-            )
-            # text label
-            fig.add_annotation(
-                xref="paper", yref="paper",
-                x=(x1 - swatch_w - 0.006),
-                y=(y_top - swatch_h / 2.0),
-                text=label,
-                showarrow=False,
-                xanchor="right",
-                yanchor="middle",
-                font=dict(size=font_size),
-                bgcolor=("rgba(255,255,255,0.70)" if with_bg else None),
-                bordercolor=("rgba(0,0,0,0.25)" if with_bg else None),
-                borderwidth=(0.5 if with_bg else 0),
-                align="left",
-                opacity=0.98,
-            )
+    # ===== Make the official subplot titles larger =====
+    # Plotly stores subplot_titles as annotations; bump sizes and tweak positions a bit.
+    for ann in fig.layout.annotations:
+        if ann.text == title_row1:
+            ann.update(font=dict(size=16), xanchor="left", x=0.01)
+        if ann.text == title_row2:
+            ann.update(font=dict(size=16), xanchor="left", x=0.01)
 
-    # Domains for precise placement
+            # ===== Internal top-right legends (unchanged) =====
+            def add_internal_legend_topright(fig, xdomain, ydomain, items,
+                                             box_pad=0.010, row_gap=0.075,
+                                             swatch_w=0.020, swatch_h=0.040,
+                                             font_size=12, with_bg=True):
+                # Draw compact legend inside the plot area
+                x1 = xdomain[1] - box_pad
+                y1 = ydomain[1] - box_pad
+                for i, (label, color) in enumerate(items):
+                    y_top = y1 - i * row_gap
+                    fig.add_shape(
+                        type="rect",
+                        xref="paper", yref="paper",
+                        x0=x1 - swatch_w, x1=x1,
+                        y0=y_top - swatch_h, y1=y_top,
+                        line=dict(width=0.5, color="rgba(0,0,0,0.25)"),
+                        fillcolor=color,
+                        layer="above",
+                    )
+                    fig.add_annotation(
+                        xref="paper", yref="paper",
+                        x=(x1 - swatch_w - 0.006),
+                        y=(y_top - swatch_h / 2.0),
+                        text=label,
+                        showarrow=False,
+                        xanchor="right",
+                        yanchor="middle",
+                        font=dict(size=font_size),
+                        bgcolor=("rgba(255,255,255,0.70)" if with_bg else None),
+                        bordercolor=("rgba(0,0,0,0.25)" if with_bg else None),
+                        borderwidth=(0.5 if with_bg else 0),
+                        align="left",
+                        opacity=0.98,
+                    )
+
+    # Domains for legend placement
     x1d = tuple(fig.layout.xaxis.domain)
     y1d = tuple(fig.layout.yaxis.domain)
     x2d = tuple(fig.layout.xaxis2.domain)
     y2d = tuple(fig.layout.yaxis2.domain)
 
-    # Subplot 1 legend (top-right)
     add_internal_legend_topright(
         fig, x1d, y1d,
         items=[("Original", "gray"), ("Reconstructed", "blue")],
         font_size=12, with_bg=True
     )
-
-    # Subplot 2 legend (top-right)
     add_internal_legend_topright(
         fig, x2d, y2d,
         items=[("Power (full, |FFT|²)", "rgba(0,128,0,0.35)"),
                ("Selected band", "rgba(0,128,0,0.95)")],
         font_size=12, with_bg=True
-    )
-
-    # Optional subtitle above subplot 2
-    fig.add_annotation(
-        xref="paper", yref="paper",
-        x=x2d[0], y=y2d[1] + 0.02,
-        text=subtitle_power,
-        showarrow=False,
-        xanchor="left", yanchor="bottom",
-        font=dict(size=12)
     )
 
     return fig
@@ -547,10 +558,7 @@ def create_app(server, prefix="/app_fft_explorer/"):
             ),
         ]),
 
-        html.Div(style={"width": "72%", "padding": "20px"}, children=[
-            html.P("The top plot shows mean-removed original (gray) and reconstruction (blue). "
-                   "Padding shows zeros on the original curve.",
-                   style={"fontSize": "14px", "marginBottom": "10px"}),
+        html.Div(style={"width": "72%", "padding": "12px"}, children=[
             dcc.Graph(id="fft-figure", style={"height": "720px"})
         ])
     ])
