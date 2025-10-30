@@ -121,7 +121,8 @@ def create_server():
         </body>
         </html>
         """)
-
+        
+    @server.get("/healthz")
     def healthz():
         # keep-alive
         cache.get("noop")
